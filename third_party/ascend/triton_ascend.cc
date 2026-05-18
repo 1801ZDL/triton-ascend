@@ -24,13 +24,19 @@
 #include "ascend/include/DynamicCVPipeline/Passes.h"
 #include "ascend/include/DynamicCVPipeline/Common/BufferCountManager.h"
 // todo: this code will be removed in version 530.
-#include "ascend/include/TritonAffinityOpt/Passes.h"
-
-#include "triton/Dialect/Triton/IR/Dialect.h"
-#include "ir.h" // TritonOpBuilder
-
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+
+#include "ascend/include/TritonAffinityOpt/Passes.h"
+
+#include "DynamicCVPipeline/AddControlFlowCondition.h"
+#include "DynamicCVPipeline/AllocMultiCache.h"
+#include "DynamicCVPipeline/AnalyzeDataFlow.h"
+#include "DynamicCVPipeline/PreCheckAvailable.h"
+#include "DynamicCVPipeline/SeparateMemoryFromComputePass.h"
+#include "DynamicCVPipeline/SplitDataflowPass.h"
+#include "ir.h" // TritonOpBuilder
+#include "triton/Dialect/Triton/IR/Dialect.h"
 
 #if TRITON_ASCEND_HAS_INPROC_COSTMODEL
 #include "AscendModel/IR/AscendModelDialect.h"
@@ -174,7 +180,7 @@ void init_triton_ascend_ir(py::module &&m) {
             }
             srcShapeIndex.push_back(val);
           }
-          
+
           llvm::SmallVector<Value> srcOffsetIndex;
           for (auto val : srcOffset) {
             if (!val.getType().isIndex()) {
@@ -367,7 +373,7 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
 
   m.def("add_triton_to_llvm", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createTritonToLLVMPass());});
-  
+
   m.def("add_bubble_up_operation", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createBubbleUpOperationPass());});
 
@@ -381,10 +387,10 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
   // todo: this code will be removed in version 530.
   m.def("add_dag_sync", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createDAGSyncPass());});
- 	   
+
   m.def("add_dag_scope", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createDAGScopePass());});
- 	   
+
   m.def("add_dag_ssbuffer", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createDAGSSBufferPass());});
 
@@ -400,6 +406,28 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
           mlir::triton::BufferCountManager::DepType::LoadStore, count);
     }
   });
+
+  m.def("pre_check_available", [](PassManager &pm) { pm.addPass(createPreCheckAvailablePass()); });
+
+  m.def("standardize_op", [](mlir::PassManager &pm) { pm.addPass(triton::createStandardizeOpPass()); });
+
+  m.def("plan_compute_block", [](mlir::PassManager &pm) { pm.addPass(mlir::triton::createPlanComputeBlockPass()); });
+
+  m.def("split_dataflow", [](mlir::PassManager &pm) { pm.addPass(mlir::triton::createSplitDataflowPass()); });
+
+  m.def("separate_memory_from_compute",
+        [](mlir::PassManager &pm) { pm.addPass(mlir::triton::createSeparateMemoryFromComputePass()); });
+
+  m.def("alloc_multi_cache", [](mlir::PassManager &pm) { pm.addPass(mlir::triton::createAllocMultiCachePass()); });
+
+  m.def("add_control_flow_condition",
+        [](mlir::PassManager &pm) { pm.addPass(mlir::triton::createAddControlFlowConditionPass()); });
+
+  m.def("compute_block_opt", [](mlir::PassManager &pm) { pm.addPass(mlir::triton::createComputeBlockOptPass()); });
+
+  m.def("remove_ssbuf_attr", [](PassManager &pm) { pm.addPass(createRemoveSsbufAttrPass()); });
+
+  m.def("analyse_dataflow", [](PassManager &pm) { pm.addPass(createAnalyzeDataFlowPass()); });
 }
 
 #if TRITON_ASCEND_HAS_INPROC_COSTMODEL

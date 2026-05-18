@@ -26,6 +26,7 @@ import os
 import re
 import subprocess
 import tempfile
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -82,7 +83,7 @@ def _get_then_remove_rc(mod, attr_name: str) -> int:
 
     if remove_attr:
         remove_attr(mod, attr_name)
-    
+
     if not isinstance(attr_value, int):
         return -1
 
@@ -108,6 +109,10 @@ def _adjust_metadata_by_module_result(mod, metadata, opt, **kwargs):
     if rc != -1 and rc > 0:
         # When the option dynamic_cv_pipeline is set to False,
         # these options should also reverted.
+        if os.environ.get("FALLBACK_ERROR", False) and rc != 2:
+            err_str = f"回退: {rc}"
+            print(err_str)
+            raise ValueError(err_str)
         metadata["enable_dynamic_cv_pipeline"] = False
         metadata["enable_mixed_cv"] = kwargs["enable_mixed_cv"]
         metadata["disable_auto_inject_block_sync"] = kwargs["disable_auto_inject_block_sync"]
@@ -232,9 +237,20 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             metadata["disable_auto_inject_block_sync"] = True
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
 
-        _intra_val = metadata.get("intra_cache_num")
-        if _intra_val is not None:
-            ascend.passes.ttir.set_buffer_count("INTRA", _intra_val)
+            # ascend.passes.ttir.pre_check_available(pm)
+            # ascend.passes.ttir.standardize_op(pm)
+            # ascend.passes.ttir.plan_compute_block(pm)
+            # ascend.passes.ttir.compute_block_opt(pm)
+            # ascend.passes.ttir.split_dataflow(pm)
+            # ascend.passes.ttir.analyse_dataflow(pm)
+            # ascend.passes.ttir.separate_memory_from_compute(pm)
+            # ascend.passes.ttir.alloc_multi_cache(pm)
+            # ascend.passes.ttir.add_control_flow_condition(pm)
+            # ascend.passes.ttir.remove_ssbuf_attr(pm)
+
+        _val = metadata.get("intra_cache_num")
+        if _val is not None:
+            ascend.passes.ttir.set_buffer_count("INTRA", _val)
 
         _inter_val = metadata.get("inter_cache_num")
         if _inter_val is not None:
@@ -622,6 +638,9 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             + _compile_option_list
             + ["-o", bin_file]
         )
+
+
+
         vf_merge_level = metadata["vf_merge_level"]
         if vf_merge_level is not None:
             cmd_list += [f"--enable-vf-merge-level={vf_merge_level}"]
@@ -1083,6 +1102,9 @@ def ttir_to_npubin(mod, metadata, opt):
             + _compile_option_list
             + ["-o", bin_file]
         )
+
+        print("[DEBUG] cmd_list: ", shlex.join(cmd_list))
+
         ret = subprocess.run(cmd_list, env = env, capture_output = True, check = True)
         if not Path(bin_path).exists():
             error_msg = ret.stderr.decode('utf-8')
