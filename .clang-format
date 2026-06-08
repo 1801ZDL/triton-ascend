@@ -2,55 +2,105 @@
 BasedOnStyle: LLVM
 Language: Cpp
 
-# 大括号换行风格配置
+# ==========================================
+# 基础风格配置
+# ==========================================
+IndentWidth: 4
+TabWidth: 4
+AccessModifierOffset: -2
+UseTab: Never
+ColumnLimit: 120
+PointerAlignment: Right
+
+# --- G.INC.07-CPP: 按照合理的顺序包含头文件 ---
+SortIncludes: CaseSensitive
+IncludeBlocks: Regroup               # 排序后按类别在块之间加空行
+IncludeIsMainRegex: '(_test\.cpp|\.cpp)$'
+
+IncludeCategories:
+  - Regex:    '^<[^.]*>$'            # 1. C++ 标准库 (如 <memory>)
+    Priority: 1
+  - Regex:    '^<.*\.h>$'            # 2. C/OS 系统库 (如 <unistd.h>)
+    Priority: 2
+  - Regex:    '^"llvm/.*"'           # 3. 外部依赖库: LLVM
+    Priority: 3
+  - Regex:    '^"mlir/.*"'           # 4. 外部依赖库: MLIR
+    Priority: 4
+  - Regex:    '^"ascend/.*"'         # 5. 项目特定头文件 (Ascend 项目代码)
+    Priority: 5
+  - Regex:    '.*'                   # 6. 其他 (兜底)
+    Priority: 6
+
+# ==========================================
+# 换行与对齐规则
+# ==========================================
+# --- G.FMT.06-CPP: 换行时将操作符留在行末 ---
+BreakBeforeBinaryOperators: None
+BreakBeforeTernaryOperators: false
+
+# 换行后的缩进或对齐
+AlignAfterOpenBracket: Align        # 参数换行时对齐开括号
+ContinuationIndentWidth: 4          # 如果无法对齐，则缩进4空格
+AlignOperands: Align                # 换行时对齐操作数
+
+# ==========================================
+# 大括号与控制流语句
+# ==========================================
+# --- G.FMT.11-CPP: 选择、循环语句必须使用大括号 ---
+InsertBraces: true                  # 自动补全 if/for/while 缺失的大括号 (Clang 15+)
+
+# 左大括号紧跟语句 (Attach 风格)
 BreakBeforeBraces: Custom
 BraceWrapping:
-  AfterClass: false          # 类定义后不换行
-  AfterControlStatement: MultiLine  # 控制语句后多行时换行
-  AfterEnum: false           # 枚举定义后不换行
-  AfterFunction: true        # 函数定义后换行（K&R风格）
-  AfterNamespace: false      # 命名空间后不换行
+  AfterClass: false
+  AfterControlStatement: Never
+  AfterEnum: false
+  AfterFunction: true               # 函数定义的大括号换行 (LLVM 常规风格)
+  AfterNamespace: false
   AfterObjCDeclaration: false
-  AfterStruct: false         # 结构体定义后不换行
-  AfterUnion: false          # 联合体定义后不换行
+  AfterStruct: false
+  AfterUnion: false
   AfterExternBlock: false
   BeforeCatch: false
-  BeforeElse: false          # else前不换行
-  BeforeLambdaBody: false    # lambda体前不换行
+  BeforeElse: false
+  BeforeLambdaBody: false
   BeforeWhile: false
   IndentBraces: false
-  SplitEmptyFunction: true   # 空函数体可以放在一行
-  SplitEmptyRecord: true     # 空记录可以放在一行
-  SplitEmptyNamespace: true  # 空命名空间可以放在一行
+  SplitEmptyFunction: false
+  SplitEmptyRecord: false
+  SplitEmptyNamespace: false
 
-# 其他相关配置
-AllowShortBlocksOnASingleLine: Empty  # 只有空块可以放在一行
-AllowShortFunctionsOnASingleLine: Inline  # 内联函数可以放在一行
-AllowShortIfStatementsOnASingleLine: Never    # if语句不允许单行
-AllowShortLoopsOnASingleLine: false           # 循环不允许单行
+# 语句合并与缩写 (配合强制大括号)
+AllowShortBlocksOnASingleLine: Never
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortLambdasOnASingleLine: All
 
-# Lambda表达式配置
-LambdaBodyIndentation: Signature  # lambda体与签名对齐
-PointerAlignment: Right           # 指针和引用靠右
-SpaceBeforeParens: ControlStatements  # 控制语句括号前加空格
-SpaceInEmptyParentheses: false    # 空括号内不加空格
-SpacesInAngles: Never             # 模板尖括号内不加空格
-SpacesInCStyleCastParentheses: false  # C风格转换括号内不加空格
-SpacesInContainerLiterals: true   # 容器字面量内加空格
-SpacesInParentheses: false        # 普通括号内不加空格
-SpacesInSquareBrackets: false     # 方括号内不加空格
+# ==========================================
+# 参数与函数调用
+# ==========================================
+AlwaysBreakAfterReturnType: None
+PenaltyReturnTypeOnItsOwnLine: 1000
+AlwaysBreakAfterDefinitionReturnType: None
+BinPackArguments: false             # 换行时每行一个参数，利于对齐
+BinPackParameters: false            # 换行时每行一个参数
+AllowAllParametersOfDeclarationOnNextLine: true
 
-# 初始化列表配置
-Cpp11BracedListStyle: true        # 使用C++11大括号初始化风格
-SpaceBeforeCpp11BracedList: true   # 大括号列表前加空格
-SpaceInEmptyBlock: false           # 空块内不加空格
-
-# 缩进配置
-IndentWidth: 4                    # 缩进宽度
-IndentCaseLabels: true      # case/default 相对于 switch 缩进
-IndentCaseBlocks: true      # case 块内的语句再缩进一层
-TabWidth: 4
-UseTab: Never                     # 不使用tab
-
-# 其他格式配置
-ColumnLimit: 120                   # 行宽限制
+# ==========================================
+# 空格与其他
+# ==========================================
+SpaceBeforeParens: ControlStatements
+SpaceInEmptyParentheses: false
+SpacesInAngles: Never
+SpacesInCStyleCastParentheses: false
+SpacesInContainerLiterals: true
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+Cpp11BracedListStyle: true
+SpaceBeforeCpp11BracedList: true
+IndentCaseLabels: true
+IndentCaseBlocks: true
+LambdaBodyIndentation: Signature
+SeparateDefinitionBlocks: Always    # 自动在函数块之间加空行
+...
