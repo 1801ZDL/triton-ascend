@@ -80,14 +80,14 @@ static bool forOpHasMainLoopAttr(scf::ForOp forOp)
     return terminator && terminator->hasAttr("ssbuffer.main_loop");
 }
 
-/// Check if a sync op's direct parent has ssbuffer.main_loop attribute
+/// Check if a sync op's ancestor chain contains a scf::ForOp with ssbuffer.main_loop attribute
 static bool parentOpHasMainLoopAttr(Operation *syncOp)
 {
     if (!syncOp) { return false; }
-    Operation *parent = syncOp->getParentOp();
-    if (!parent) { return false; }
-    if (auto forOp = dyn_cast<scf::ForOp>(parent)) {
-        return forOpHasMainLoopAttr(forOp);
+    for (Operation *parent = syncOp->getParentOp(); parent; parent = parent->getParentOp()) {
+        if (auto forOp = dyn_cast<scf::ForOp>(parent)) {
+            return forOpHasMainLoopAttr(forOp);
+        }
     }
     return false;
 }
