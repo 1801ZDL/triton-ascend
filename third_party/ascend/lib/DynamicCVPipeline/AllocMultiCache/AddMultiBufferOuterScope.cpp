@@ -955,8 +955,9 @@ void AddMultiBufferOuterScopePass::runOnOperation()
     }
     LDBG("[Step 1/3] Done: " << groups.size() << " transfer groups");
 
-    int interCoreBufNum = BufferCountManager::getInstance()
-        .getBufferCountByType(BufferCountManager::DepType::InterCore);
+    BufferCountManager bufferCountMgr(module);
+    int interCoreBufNum =
+        bufferCountMgr.getBufferCountByType(BufferCountManager::DepType::InterCore);
     bool isDoubleBuf = (interCoreBufNum > 1);
     LDBG("[BufferCount] interCoreBufNum=" << interCoreBufNum << " doubleBuf=" << isDoubleBuf);
 
