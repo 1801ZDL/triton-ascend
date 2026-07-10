@@ -1,5 +1,12 @@
 #pragma once
 #include "ascend/include/AutoBlockify/Passes.h"
+#include "ascend/include/DynamicCVPipeline/ComputeBlockOptPass.h"
+#include "ascend/include/DynamicCVPipeline/SplitIfByBlockIdPass.h"
+#include "ascend/include/DynamicCVPipeline/SplitDataflow/RefineArgsBlockId.h"
+#include "ascend/include/DynamicCVPipeline/Passes.h"
+#include "ascend/include/DynamicCVPipeline/StandardizeOp.h"
+#include "ascend/include/TritonToLinalg/Passes.h"
+#include "ascend/include/TritonControlFlowOpt/Passes.h"
 #include "ascend/include/DiscreteMaskAccessConversion/Passes.h"
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition.h"
 #include "ascend/include/DynamicCVPipeline/AllocMultiCache/AddMultiBufferInnerScope.h"
@@ -189,6 +196,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::triton::registerRemoveSsbufAttrPasses();
   mlir::triton::registerAnalyzeDataFlowPasses();
   mlir::triton::registerComputeBlockOptPasses();
+  mlir::triton::registerSplitIfByBlockIdPasses();
   mlir::triton::registerPlanComputeBlockPasses();
   mlir::triton::registerOpClassifierPass();
   mlir::triton::registerRefineArgsBlockIdPasses();
