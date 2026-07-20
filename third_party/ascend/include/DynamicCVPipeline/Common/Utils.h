@@ -22,6 +22,7 @@
 
 #ifndef ADD_AUTO_SCHEDULING_COMMON_UTILS_H
 #define ADD_AUTO_SCHEDULING_COMMON_UTILS_H
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
@@ -116,6 +117,74 @@ bool hasFallbackAttr(ModuleOp module);
 bool isScfOp(Operation *op);
 bool isOnlyDirectlyUse(Operation *preOp, Operation *nextOp,
                        const CVPipeline::MemoryDependenceGraph &memGraph);
+
+// Wrapper around a "main loop" — either scf.for or scf.while carrying the
+// ssbuffer.main_loop attribute. Lets downstream code treat both uniformly.
+class MainLoop {
+public:
+  Operation *op = nullptr;
+  Block *body = nullptr;
+  Value iterCounter;
+
+  Block *getBody() const { return body; }
+  Operation *getOperation() const { return op; }
+  MLIRContext *getContext() const { return op->getContext(); }
+  Location getLoc() const { return op->getLoc(); }
+  Block *getBlock() const { return op->getBlock(); }
+  Block::iterator getIterator() const { return op->getIterator(); }
+  Operation *operator->() const { return op; }
+  bool isWhile() const { return isa<scf::WhileOp>(op); }
+
+  // Iter args carried across loop iterations, as BlockArguments.
+  // forOp:   getRegionIterArgs().
+  // whileOp: after-body args.
+  SmallVector<Value> getIterArgs() const {
+    SmallVector<Value> result;
+    if (auto f = dyn_cast<scf::ForOp>(op)) {
+      result.append(f.getRegionIterArgs().begin(), f.getRegionIterArgs().end());
+    } else if (auto w = dyn_cast<scf::WhileOp>(op)) {
+      Block::BlockArgListType args = w.getAfterBody()->getArguments();
+      result.append(args.begin(), args.end());
+    }
+    return result;
+  }
+
+  // Only meaningful for whileOp (before-body args); forOp returns empty.
+  // Same count/types as getIterArgs() on whileOp, distinct Value identity.
+  SmallVector<Value> getBeforeIterArgs() const {
+    SmallVector<Value> result;
+    if (auto w = dyn_cast<scf::WhileOp>(op)) {
+      Block::BlockArgListType args = w.getBeforeBody()->getArguments();
+      result.append(args.begin(), args.end());
+    }
+    return result;
+  }
+
+  static MainLoop get(Operation *o) {
+    MainLoop ml;
+    ml.op = o;
+    if (auto f = dyn_cast<scf::ForOp>(o))
+      ml.body = f.getBody();
+    else if (auto w = dyn_cast<scf::WhileOp>(o))
+      ml.body = w.getAfterBody();
+    return ml;
+  }
+
+  // Returns the scf.yield terminator of a forOp's body / whileOp's after
+  // body. Returns {} if `loopOp` is neither.
+  static scf::YieldOp getLoopYieldOp(Operation *loopOp) {
+    if (auto forOp = dyn_cast<scf::ForOp>(loopOp))
+      return dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+    if (auto whileOp = dyn_cast<scf::WhileOp>(loopOp))
+      return dyn_cast<scf::YieldOp>(whileOp.getAfter().front().getTerminator());
+    return {};
+  }
+};
+
+// True when `op` is a main_loop loop op (forOp / whileOp carrying the tag).
+inline bool isMainLoopOp(Operation *op) {
+  return op && isa<scf::ForOp, scf::WhileOp>(op) && op->hasAttr(kMainLoop);
+}
 
 inline bool isCubeOp(Operation *op) {
   return !isScfOp(op) && CVPipeline::getOpCoreType(op) == CoreType::CUBE_ONLY;
