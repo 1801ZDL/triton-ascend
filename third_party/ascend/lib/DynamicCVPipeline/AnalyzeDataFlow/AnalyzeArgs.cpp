@@ -48,28 +48,6 @@ using namespace triton;
 
 namespace {
 
-static constexpr llvm::StringLiteral containedFunc[]{
-    "fused_chunk_ttt_linear_bwd_kernel_h",
-};
-
-static LogicalResult isInterceptedModule(ModuleOp module) {
-  bool intercepted = false;
-
-  module.walk([&](func::FuncOp funcOp) -> WalkResult {
-    if (!llvm::is_contained(containedFunc, funcOp.getSymName())) {
-      return WalkResult::advance();
-    }
-    intercepted = true;
-    return WalkResult::interrupt();
-  });
-
-  if (!intercepted) {
-    return success();
-  }
-
-  return failure();
-}
-
 // Check if a value is a tensor-type iter_arg and return its index, -1
 // otherwise.
 static int getTensorIterArgIndex(Value v, scf::ForOp forOp) {
