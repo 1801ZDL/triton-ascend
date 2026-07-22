@@ -45,8 +45,7 @@ void ReinterpretCastSinkingPass::runOnOperation() {
 
   // Collect all reinterpret_cast ops first, since we'll be modifying the IR.
   SmallVector<memref::ReinterpretCastOp> opsToProcess;
-  mod->walk(
-      [&](memref::ReinterpretCastOp op) { opsToProcess.push_back(op); });
+  mod->walk([&](memref::ReinterpretCastOp op) { opsToProcess.push_back(op); });
 
   int totalProcessed = 0;
   int totalCloned = 0;
