@@ -20,10 +20,8 @@
  * THE SOFTWARE.
  */
 
-#ifndef TRITON_ADAPTER_MARK_GM_LOAD_PASS_H
-#define TRITON_ADAPTER_MARK_GM_LOAD_PASS_H
-
-#include <memory>
+#ifndef TRITON_ADAPTER_DYNAMIC_CVPIPELINE_SPLIT_IF_BY_BLOCK_ID_H
+#define TRITON_ADAPTER_DYNAMIC_CVPIPELINE_SPLIT_IF_BY_BLOCK_ID_H
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
@@ -31,25 +29,29 @@
 namespace mlir {
 namespace triton {
 
-/// Sub-pass of SeparateMemoryFromComputePass that marks global memory load
-/// operations to be decoupled from compute operations.
-class MarkGMLoadPass
-    : public PassWrapper<MarkGMLoadPass, OperationPass<ModuleOp>> {
+class SplitIfByBlockIdPass
+    : public PassWrapper<SplitIfByBlockIdPass, OperationPass<ModuleOp>> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MarkGMLoadPass)
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SplitIfByBlockIdPass)
 
-  MarkGMLoadPass() = default;
-
-  StringRef getArgument() const override { return "mark-gm-load"; }
-
-  void getDependentDialects(DialectRegistry &registry) const override;
+  SplitIfByBlockIdPass() = default;
 
   void runOnOperation() override;
+
+  llvm::StringRef getArgument() const final { return "split-if-by-block-id"; }
+
+  llvm::StringRef getDescription() const final {
+    return "Split scf.if operations so that each if contains only ops of a "
+           "single block_id";
+  }
+
+  void getDependentDialects(DialectRegistry &registry) const override;
 };
 
-std::unique_ptr<OperationPass<ModuleOp>> createMarkGMLoadPass();
+std::unique_ptr<OperationPass<ModuleOp>> createSplitIfByBlockIdPass();
+void registerSplitIfByBlockIdPasses();
 
 } // namespace triton
 } // namespace mlir
 
-#endif // TRITON_ADAPTER_MARK_GM_LOAD_PASS_H
+#endif // TRITON_ADAPTER_DYNAMIC_CVPIPELINE_SPLIT_IF_BY_BLOCK_ID_H
