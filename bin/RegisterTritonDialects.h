@@ -74,6 +74,7 @@
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/NVVMToLLVM/NVVMToLLVM.h"
 #include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
+#include "ascend/include/DynamicCVPipeline/SplitIfByBlockIdPass.h"
 
 namespace mlir {
 namespace test {
@@ -165,6 +166,9 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
 
   // NVWS passes
   mlir::triton::registerNVWSTransformsPasses();
+
+  // Ascend DynamicCVPipeline passes
+  mlir::triton::registerSplitIfByBlockIdPasses();
 
   // NVGPU transform passes
   mlir::registerNVHopperTransformsPasses();
