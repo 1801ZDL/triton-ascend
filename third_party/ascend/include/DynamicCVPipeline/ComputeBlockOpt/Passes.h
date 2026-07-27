@@ -38,6 +38,9 @@ std::unique_ptr<OperationPass<ModuleOp>> createMergeCubeForBlockPass();
 void registerMergeCubeForBlockPass();
 std::unique_ptr<OperationPass<ModuleOp>> createFixpipeOptPass();
 
+void registerSplitIfByBlockIdPass();
+std::unique_ptr<OperationPass<ModuleOp>> createSplitIfByBlockIdPass();
+
 } // namespace triton
 } // namespace mlir
 
