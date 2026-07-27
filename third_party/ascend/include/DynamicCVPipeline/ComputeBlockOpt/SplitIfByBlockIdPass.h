@@ -20,8 +20,10 @@
  * THE SOFTWARE.
  */
 
-#ifndef TRITON_ADAPTER_BLOCK_ID_OPT_PASSES_H
-#define TRITON_ADAPTER_BLOCK_ID_OPT_PASSES_H
+#ifndef TRITON_ADAPTER_MARK_GM_LOAD_PASS_H
+#define TRITON_ADAPTER_MARK_GM_LOAD_PASS_H
+
+#include <memory>
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
@@ -29,21 +31,25 @@
 namespace mlir {
 namespace triton {
 
-std::unique_ptr<OperationPass<ModuleOp>> createUBUsageOptPass();
-std::unique_ptr<OperationPass<ModuleOp>> createUnifyAllocBlockPass();
-void registerUnifyAllocBlockPass();
-std::unique_ptr<OperationPass<ModuleOp>> createMergeVectorIfBlockPass();
-void registerMergeVectorIfBlockPass();
-std::unique_ptr<OperationPass<ModuleOp>> createMergeCubeForBlockPass();
-void registerMergeCubeForBlockPass();
-std::unique_ptr<OperationPass<ModuleOp>> createUnifyStoreBlockPass();
-void registerUnifyStoreBlockPass();
-std::unique_ptr<OperationPass<ModuleOp>> createFixpipeOptPass();
+/// Sub-pass of SeparateMemoryFromComputePass that marks global memory load
+/// operations to be decoupled from compute operations.
+class MarkGMLoadPass
+    : public PassWrapper<MarkGMLoadPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MarkGMLoadPass)
 
-void registerSplitIfByBlockIdPass();
-std::unique_ptr<OperationPass<ModuleOp>> createSplitIfByBlockIdPass();
+  MarkGMLoadPass() = default;
+
+  StringRef getArgument() const override { return "mark-gm-load"; }
+
+  void getDependentDialects(DialectRegistry &registry) const override;
+
+  void runOnOperation() override;
+};
+
+std::unique_ptr<OperationPass<ModuleOp>> createMarkGMLoadPass();
 
 } // namespace triton
 } // namespace mlir
 
-#endif // TRITON_ADAPTER_BLOCK_ID_OPT_PASSES_H
+#endif // TRITON_ADAPTER_MARK_GM_LOAD_PASS_H
