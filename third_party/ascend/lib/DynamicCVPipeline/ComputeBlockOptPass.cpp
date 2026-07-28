@@ -20,15 +20,14 @@
  * THE SOFTWARE.
  */
 
-#include "mlir/Pass/PassManager.h"
-
-#include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/ComputeBlockOptPass.h"
-#include "ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
-
 #include "DynamicCVPipeline/ComputeBlockOpt/Passes.h"
 #include "DynamicCVPipeline/PlanComputeBlock/Passes.h"
 #include "DynamicCVPipeline/PlanComputeBlock/ReorderOpsByBlockId.h"
+#include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
+
+#include "mlir/Pass/PassManager.h"
 
 using namespace mlir;
 using namespace triton;
@@ -48,12 +47,20 @@ void ComputeBlockOptPass::runOnOperation() {
      location and divide the computation blocks.
    */
   pm.addPass(createUnifyAllocBlockPass());
+  pm.addPass(createReorderOpsByBlockIdPass());
+
   pm.addPass(createMergeVectorIfBlockPass());
+  pm.addPass(createReorderOpsByBlockIdPass());
+
   pm.addPass(createUnifyStoreBlockPass());
+
   pm.addPass(createMergeCubeForBlockPass());
+  pm.addPass(createReorderOpsByBlockIdPass());
+
   pm.addPass(createUBUsageOptPass());
+  pm.addPass(createReorderOpsByBlockIdPass());
+
   pm.addPass(createFixpipeOptPass());
-  pm.addPass(createSplitIfByBlockIdPass());
   pm.addPass(createReorderOpsByBlockIdPass());
 
   if (failed(runPipeline(pm, module))) {
