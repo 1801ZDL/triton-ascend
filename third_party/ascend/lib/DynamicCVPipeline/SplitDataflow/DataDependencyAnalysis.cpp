@@ -652,9 +652,18 @@ void DataDependencyAnalysisPass::collectMemDepInfo(
 
 // Trace defining op chain to check if any upstream op is vector-only.
 // Returns true if a vector-only op is found in the chain.
+// Values in `stopValues` are treated as already-handled scalar dependencies;
+// the trace stops when it hits one, avoiding redundant detection of downstream
+// scalars whose upstream values have already been transferred via SSBuffer.
 // This mirrors AnalyzeCubeControlFlowInputChain's hasIncompatibleOpForCondition.
-static bool hasVectorOpInDefChain(mlir::Value val,
-                                  llvm::DenseSet<mlir::Operation *> &visited) {
+static bool hasVectorOpInDefChain(
+    mlir::Value val,
+    llvm::DenseSet<mlir::Operation *> &visited,
+    const llvm::DenseSet<mlir::Value> *stopValues = nullptr) {
+  if (stopValues && stopValues->contains(val)) {
+    return false;
+  }
+
   mlir::Operation *defOp = val.getDefiningOp();
   if (!defOp || visited.contains(defOp)) {
     return false;
@@ -666,7 +675,7 @@ static bool hasVectorOpInDefChain(mlir::Value val,
   }
 
   for (mlir::Value operand : defOp->getOperands()) {
-    if (hasVectorOpInDefChain(operand, visited)) {
+    if (hasVectorOpInDefChain(operand, visited, stopValues)) {
       return true;
     }
   }
@@ -717,10 +726,19 @@ static bool ifOpHasCubeOps(
 // Detects when scf.for loop bounds or scf.if conditions are scalar values whose
 // defining chain traces back to vector-only ops (e.g. math.floor/math.ceil on
 // tensors, linalg.reduce). These scalars must be transferred from VECTOR to CUBE.
+//
+// To avoid redundant transfers, scalars already recorded as dependencies are
+// tracked in a stop-set: downstream scalars whose defining chain only reaches
+// vector-only ops through an already-handled scalar are NOT re-recorded.
 void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
     DataDependencyInfo &info) {
   auto &blockInfoMap = info.getBlockInfoMap();
   auto &v2cDependencies = info.getV2CDependencies();
+
+  // Scalars already recorded as V->C deps — downstream values depending on
+  // these don't need separate transfer since the upstream value will be
+  // available on the CUBE side after SSBuffer transfer.
+  llvm::DenseSet<mlir::Value> handledScalarValues;
 
   LOG_DEBUG("Analyzing scalar V->C dependencies from control flow ops...\n");
 
@@ -750,7 +768,7 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
       }
 
       llvm::DenseSet<mlir::Operation *> visited;
-      if (!hasVectorOpInDefChain(bound, visited)) {
+      if (!hasVectorOpInDefChain(bound, visited, &handledScalarValues)) {
         continue;
       }
 
@@ -783,6 +801,7 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
                        producerId, consumerId, info);
         v2cDependencies.back().isScaler = true;
       }
+      handledScalarValues.insert(bound);
     }
   });
 
@@ -803,7 +822,7 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
     }
 
     llvm::DenseSet<mlir::Operation *> visited;
-    if (!hasVectorOpInDefChain(condition, visited)) {
+    if (!hasVectorOpInDefChain(condition, visited, &handledScalarValues)) {
       return;
     }
 
@@ -829,6 +848,7 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
     collectDepInfo(condition, DependencyType::VectorToCube, v2cDependencies,
                    producerId, consumerId, info);
     v2cDependencies.back().isScaler = true;
+    handledScalarValues.insert(condition);
   });
 
   LOG_DEBUG("Scalar V->C dependency analysis complete.\n");
