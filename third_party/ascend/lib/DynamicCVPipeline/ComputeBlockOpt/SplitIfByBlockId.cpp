@@ -25,12 +25,18 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+<<<<<<< HEAD:third_party/ascend/lib/DynamicCVPipeline/ComputeBlockOpt/SplitIfByBlockId.cpp
 #include "llvm/ADT/StringRef.h"
+=======
+>>>>>>> 190214a1e (clone scalar ops):third_party/ascend/lib/DynamicCVPipeline/SplitIfByBlockId.cpp
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 
+<<<<<<< HEAD:third_party/ascend/lib/DynamicCVPipeline/ComputeBlockOpt/SplitIfByBlockId.cpp
 #include "mlir/Analysis/AliasAnalysis.h"
+=======
+>>>>>>> 190214a1e (clone scalar ops):third_party/ascend/lib/DynamicCVPipeline/SplitIfByBlockId.cpp
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -43,9 +49,13 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Operation.h"
+<<<<<<< HEAD:third_party/ascend/lib/DynamicCVPipeline/ComputeBlockOpt/SplitIfByBlockId.cpp
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/WalkResult.h"
+=======
+#include "mlir/Support/LLVM.h"
+>>>>>>> 190214a1e (clone scalar ops):third_party/ascend/lib/DynamicCVPipeline/SplitIfByBlockId.cpp
 
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/ComputeBlockOpt/Passes.h"
@@ -442,8 +452,11 @@ static void preprocessScalarDependencies(CandidateIf &cand) {
     // insert them to the start of group, so that their inner operands can also
     // be rewritten
     allOps.insert(allOps.begin(), newOps.begin(), newOps.end());
+<<<<<<< HEAD:third_party/ascend/lib/DynamicCVPipeline/ComputeBlockOpt/SplitIfByBlockId.cpp
     group.nestedIfs.clear();
     group.ops.clear();
+=======
+>>>>>>> 190214a1e (clone scalar ops):third_party/ascend/lib/DynamicCVPipeline/SplitIfByBlockId.cpp
 
     for (Operation *op : allOps) {
       op->walk([&](Operation *innerOp) {
