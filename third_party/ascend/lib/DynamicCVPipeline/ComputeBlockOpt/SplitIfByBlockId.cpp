@@ -25,18 +25,10 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
-<<<<<<< HEAD:third_party/ascend/lib/DynamicCVPipeline/ComputeBlockOpt/SplitIfByBlockId.cpp
-#include "llvm/ADT/StringRef.h"
-=======
->>>>>>> 190214a1e (clone scalar ops):third_party/ascend/lib/DynamicCVPipeline/SplitIfByBlockId.cpp
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 
-<<<<<<< HEAD:third_party/ascend/lib/DynamicCVPipeline/ComputeBlockOpt/SplitIfByBlockId.cpp
-#include "mlir/Analysis/AliasAnalysis.h"
-=======
->>>>>>> 190214a1e (clone scalar ops):third_party/ascend/lib/DynamicCVPipeline/SplitIfByBlockId.cpp
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -46,22 +38,13 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Operation.h"
-<<<<<<< HEAD:third_party/ascend/lib/DynamicCVPipeline/ComputeBlockOpt/SplitIfByBlockId.cpp
-#include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
-#include "mlir/Support/WalkResult.h"
-=======
-#include "mlir/Support/LLVM.h"
->>>>>>> 190214a1e (clone scalar ops):third_party/ascend/lib/DynamicCVPipeline/SplitIfByBlockId.cpp
 
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
-#include "ascend/include/DynamicCVPipeline/ComputeBlockOpt/Passes.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
-
-#include "DynamicCVPipeline/Common/MemoryEffectsTracker.h"
+#include "ascend/include/DynamicCVPipeline/ComputeBlockOpt/SplitIfByBlockIdPass.h"
 
 static constexpr const char *DEBUG_TYPE = "SplitIfByBlockId";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
@@ -327,34 +310,51 @@ static SmallVector<BlockGroup> groupOpsInBlock(Block &block) {
   return groups;
 }
 
-static SmallVector<CandidateIf>
-discoverCandidates(llvm::ArrayRef<scf::ForOp> mainLoops) {
+/// Return true if \p op is nested inside a scf.for with the main_loop
+/// attribute. Only if-ops inside the main loop should be split;
+/// prologue/epilogue ifs outside the main loop are not candidates for this
+/// optimization.
+static bool isInsideMainLoop(Operation *op) {
+  for (auto *parent = op->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    if (auto forOp = dyn_cast<scf::ForOp>(parent)) {
+      if (forOp->hasAttr(CVPipeline::kMainLoop)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+static SmallVector<CandidateIf> discoverCandidates(ModuleOp module) {
   SmallVector<CandidateIf> result;
 
-  for (auto forOp : mainLoops) {
-    forOp.walk([&](scf::IfOp ifOp) {
-      CandidateIf cand;
-      cand.ifOp = ifOp;
-      cand.hasYield = (ifOp->getNumResults() > 0);
+  module.walk([&](scf::IfOp ifOp) {
+    if (!isInsideMainLoop(ifOp)) {
+      return;
+    }
 
-      // self block_id
-      auto selfBlockId = CVPipeline::getOpBlockId(ifOp);
-      cand.selfBlockId = selfBlockId.value_or(-1);
+    CandidateIf cand;
+    cand.ifOp = ifOp;
+    cand.hasYield = (ifOp->getNumResults() > 0);
 
-      // Group then region
-      cand.thenGroups = groupOpsInBlock(*ifOp.thenBlock());
+    // self block_id
+    auto selfBlockId = CVPipeline::getOpBlockId(ifOp);
+    cand.selfBlockId = selfBlockId.value_or(-1);
 
-      // Group else region
-      Block *elseBlk = ifOp.elseBlock();
-      if (elseBlk) {
-        cand.elseGroups = groupOpsInBlock(*elseBlk);
-      }
+    // Group then region
+    cand.thenGroups = groupOpsInBlock(*ifOp.thenBlock());
 
-      if (cand.needsSplit()) {
-        result.push_back(cand);
-      }
-    });
-  }
+    // Group else region
+    Block *elseBlk = ifOp.elseBlock();
+    if (elseBlk) {
+      cand.elseGroups = groupOpsInBlock(*elseBlk);
+    }
+
+    if (cand.needsSplit()) {
+      result.push_back(cand);
+    }
+  });
 
   return result;
 }
@@ -452,11 +452,6 @@ static void preprocessScalarDependencies(CandidateIf &cand) {
     // insert them to the start of group, so that their inner operands can also
     // be rewritten
     allOps.insert(allOps.begin(), newOps.begin(), newOps.end());
-<<<<<<< HEAD:third_party/ascend/lib/DynamicCVPipeline/ComputeBlockOpt/SplitIfByBlockId.cpp
-    group.nestedIfs.clear();
-    group.ops.clear();
-=======
->>>>>>> 190214a1e (clone scalar ops):third_party/ascend/lib/DynamicCVPipeline/SplitIfByBlockId.cpp
 
     for (Operation *op : allOps) {
       op->walk([&](Operation *innerOp) {
@@ -947,8 +942,7 @@ static Value getRootTensor(Value v) {
 /// scf.if has no yield results to passthrough.
 /// When \p referenceValue traces to a function argument, the placeholder
 /// preserves that provenance instead of creating a fresh alloca.
-static Value createPlaceholderValue(int64_t blockId, OpBuilder &builder,
-                                    Location loc, Type type,
+static Value createPlaceholderValue(OpBuilder &builder, Location loc, Type type,
                                     Value referenceValue = Value()) {
   Value result;
   bool usedTrace = false;
@@ -1120,7 +1114,7 @@ static Value createPlaceholderValue(int64_t blockId, OpBuilder &builder,
   // meaningful block_id — don't overwrite it.
   if (!usedTrace) {
     result.getDefiningOp()->setAttr(CVPipeline::kBlockId,
-                                    builder.getI32IntegerAttr(blockId));
+                                    builder.getI32IntegerAttr(-1));
   }
   return result;
 }
@@ -1197,8 +1191,7 @@ rewireAndMoveOps(BlockGroup &group,
 /// Constants (arith::ConstantOp) are NOT cloned — the pre-created placeholder
 /// already dominates and cloning would perturb cross-group tracking.
 /// Other values are returned unchanged.
-static Value ensureLocalValue(int64_t blockId, Value val, Block &elseBlock,
-                              OpBuilder &builder) {
+static Value ensureLocalValue(Value val, Block &elseBlock, OpBuilder &builder) {
   // Block arguments always dominate
   if (isa<BlockArgument>(val)) {
     return val;
@@ -1219,7 +1212,7 @@ static Value ensureLocalValue(int64_t blockId, Value val, Block &elseBlock,
     OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToEnd(&elseBlock);
     auto *cloned = builder.clone(*defOp);
-    cloned->setAttr(CVPipeline::kBlockId, builder.getI32IntegerAttr(blockId));
+    cloned->setAttr(CVPipeline::kBlockId, builder.getI32IntegerAttr(-1));
     return cloned->getResult(0);
   }
 
@@ -1229,16 +1222,14 @@ static Value ensureLocalValue(int64_t blockId, Value val, Block &elseBlock,
 /// Create placeholders for a group's output types inside the else block.
 /// Each placeholder is created locally in the else block with block_id = -1.
 static SmallVector<Value, 4>
-buildElsePlaceholders(int64_t blockId, ArrayRef<Type> types,
-                      ArrayRef<Value> refValues, Block &elseBlock, Location loc,
-                      OpBuilder &builder) {
+buildElsePlaceholders(ArrayRef<Type> types, ArrayRef<Value> refValues,
+                      Block &elseBlock, Location loc, OpBuilder &builder) {
   OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointToEnd(&elseBlock);
   SmallVector<Value, 4> result;
   for (unsigned idx = 0; idx < types.size(); ++idx) {
     Value ref = idx < refValues.size() ? refValues[idx] : Value();
-    result.push_back(
-        createPlaceholderValue(blockId, builder, loc, types[idx], ref));
+    result.push_back(createPlaceholderValue(builder, loc, types[idx], ref));
   }
   return result;
 }
@@ -1282,8 +1273,7 @@ static bool valueDominates(Value val, Block *block) {
 /// For other slots (pure cross-group augmentation, Case A, or when the
 /// original else value is defined inside the original else block and does
 /// not dominate the new split-if), creates placeholder values.
-static void buildElseYieldForGroup(const int64_t blockId,
-                                   const GroupOutputInfo &output,
+static void buildElseYieldForGroup(const GroupOutputInfo &output,
                                    Block &elseBlock, Location loc,
                                    OpBuilder &builder) {
   builder.setInsertionPointToEnd(&elseBlock);
@@ -1296,7 +1286,7 @@ static void buildElseYieldForGroup(const int64_t blockId,
     if (it != placeholderCache.end()) {
       return it->second;
     }
-    Value ph = createPlaceholderValue(blockId, builder, loc, type, ref);
+    Value ph = createPlaceholderValue(builder, loc, type, ref);
     placeholderCache[type] = ph;
     return ph;
   };
@@ -1310,8 +1300,7 @@ static void buildElseYieldForGroup(const int64_t blockId,
       // block (e.g., Scene 3/4). Such values do NOT dominate the new
       // split-if's else block. In that case, fall back to a placeholder.
       if (valueDominates(elseVal, &elseBlock)) {
-        yieldVals.push_back(
-            ensureLocalValue(blockId, elseVal, elseBlock, builder));
+        yieldVals.push_back(ensureLocalValue(elseVal, elseBlock, builder));
       } else {
         yieldVals.push_back(getOrCreatePlaceholder(output.outputTypes[idx],
                                                    output.outputValues[idx]));
@@ -1408,8 +1397,7 @@ static void buildThenYieldForLastIf(
 
 /// Build else yield for the last-if in Case B.
 /// Absorbs other-side ops (Scene 3/4) or creates placeholders.
-static void buildElseYieldForLastIf(int64_t blockId,
-                                    const OtherSideContext &otherCtx,
+static void buildElseYieldForLastIf(const OtherSideContext &otherCtx,
                                     ArrayRef<Type> lastIfTypes,
                                     Block &elseBlock, Location loc,
                                     OpBuilder &builder) {
@@ -1433,11 +1421,11 @@ static void buildElseYieldForLastIf(int64_t blockId,
   // For slots beyond the original yield count, use placeholders.
   for (unsigned slot = 0; slot < lastIfTypes.size(); ++slot) {
     if (slot < otherCtx.yieldValues.size()) {
-      yieldVals.push_back(ensureLocalValue(blockId, otherCtx.yieldValues[slot],
-                                           elseBlock, builder));
+      yieldVals.push_back(
+          ensureLocalValue(otherCtx.yieldValues[slot], elseBlock, builder));
     } else {
-      yieldVals.push_back(createPlaceholderValue(blockId, builder, loc,
-                                                 lastIfTypes[slot], Value()));
+      yieldVals.push_back(
+          createPlaceholderValue(builder, loc, lastIfTypes[slot], Value()));
     }
   }
 
@@ -1461,8 +1449,6 @@ static void updateCrossValueReplacementGroup(
     crossValueReplacement[oldVal] = newVal;
   }
 }
-
-static constexpr llvm::StringLiteral kSplittedIf = "ssbuffer.splitted_if";
 
 // ============================================================================
 // Part3: Materialization (orchestrator)
@@ -1523,21 +1509,21 @@ static void materializeCandidate(CandidateIf &c, OpBuilder &builder,
   // filling then/else blocks leaves the builder INSIDE those blocks.
   for (unsigned gi = 0; gi < nGroups - 1; ++gi) {
     auto &output = ya.groupOutputs[gi];
-    scf::IfOp splittedIf;
 
     if (output.isVoid()) {
       // Pure side-effect group: void if (no results, no else).
       LDBG("    [Part3] group[" << gi << "] void if");
 
       builder.setInsertionPointAfter(lastCreatedIf);
-      splittedIf = builder.create<scf::IfOp>(loc, condition, /*hasElse=*/false);
-      splittedIf->setAttr(CVPipeline::kBlockId,
-                          builder.getI32IntegerAttr(groups[gi].blockId));
-      lastCreatedIf = splittedIf.getOperation();
-      if (splittedIf.getThenRegion().empty()) {
-        splittedIf.getThenRegion().emplaceBlock();
+      auto voidIf =
+          builder.create<scf::IfOp>(loc, condition, /*hasElse=*/false);
+      voidIf->setAttr(CVPipeline::kBlockId,
+                      builder.getI32IntegerAttr(bm.getNextId()));
+      lastCreatedIf = voidIf.getOperation();
+      if (voidIf.getThenRegion().empty()) {
+        voidIf.getThenRegion().emplaceBlock();
       }
-      Block &thenBlock = splittedIf.getThenRegion().front();
+      Block &thenBlock = voidIf.getThenRegion().front();
       if (thenBlock.mightHaveTerminator()) {
         thenBlock.getTerminator()->erase();
       }
@@ -1554,20 +1540,20 @@ static void materializeCandidate(CandidateIf &c, OpBuilder &builder,
                                 << output.outputValues.size() << " outputs)");
 
       builder.setInsertionPointAfter(lastCreatedIf);
-      splittedIf = builder.create<scf::IfOp>(loc, output.outputTypes, condition,
+      auto newIf = builder.create<scf::IfOp>(loc, output.outputTypes, condition,
                                              /*hasElse=*/true);
-      splittedIf->setAttr(CVPipeline::kBlockId,
-                          builder.getI32IntegerAttr(groups[gi].blockId));
-      lastCreatedIf = splittedIf.getOperation();
-      if (splittedIf.getThenRegion().empty()) {
-        splittedIf.getThenRegion().emplaceBlock();
+      newIf->setAttr(CVPipeline::kBlockId,
+                     builder.getI32IntegerAttr(bm.getNextId()));
+      lastCreatedIf = newIf.getOperation();
+      if (newIf.getThenRegion().empty()) {
+        newIf.getThenRegion().emplaceBlock();
       }
-      if (splittedIf.getElseRegion().empty()) {
-        splittedIf.getElseRegion().emplaceBlock();
+      if (newIf.getElseRegion().empty()) {
+        newIf.getElseRegion().emplaceBlock();
       }
 
       // Fill then block.
-      Block &thenBlock = splittedIf.getThenRegion().front();
+      Block &thenBlock = newIf.getThenRegion().front();
       if (thenBlock.mightHaveTerminator()) {
         thenBlock.getTerminator()->erase();
       }
@@ -1575,22 +1561,19 @@ static void materializeCandidate(CandidateIf &c, OpBuilder &builder,
       buildThenYieldForGroup(output, thenBlock, loc, builder);
 
       // Fill else block with placeholders.
-      Block &elseBlock = splittedIf.getElseRegion().front();
+      Block &elseBlock = newIf.getElseRegion().front();
       if (elseBlock.mightHaveTerminator()) {
         elseBlock.getTerminator()->erase();
       }
-      buildElseYieldForGroup(groups[gi].blockId, output, elseBlock, loc,
-                             builder);
+      buildElseYieldForGroup(output, elseBlock, loc, builder);
 
       // Register produced values for downstream groups.
-      updateCrossValueReplacementGroup(output, splittedIf, thenBlock,
+      updateCrossValueReplacementGroup(output, newIf, thenBlock,
                                        crossValueReplacement);
     }
-    splittedIf->setAttr(kSplittedIf, builder.getUnitAttr());
   }
 
   // Phase 2: Materialize the last group.
-  scf::IfOp lastIf;
   unsigned lastGi = nGroups - 1;
   if (c.hasYield) {
     // Case B: last-if carries ALL original result types.
@@ -1602,10 +1585,10 @@ static void materializeCandidate(CandidateIf &c, OpBuilder &builder,
     LDBG("    [Part3] last-if (Case B, " << ya.numOriginalSlots << " results)");
 
     builder.setInsertionPointAfter(lastCreatedIf);
-    lastIf = builder.create<scf::IfOp>(loc, lastIfTypes, condition,
-                                       /*hasElse=*/true);
+    auto lastIf = builder.create<scf::IfOp>(loc, lastIfTypes, condition,
+                                            /*hasElse=*/true);
     lastIf->setAttr(CVPipeline::kBlockId,
-                    builder.getI32IntegerAttr(groups[lastGi].blockId));
+                    builder.getI32IntegerAttr(bm.getNextId()));
     if (lastIf.getThenRegion().empty()) {
       lastIf.getThenRegion().emplaceBlock();
     }
@@ -1624,8 +1607,7 @@ static void materializeCandidate(CandidateIf &c, OpBuilder &builder,
 
     // Fill else block (with Scene 3/4 absorption if needed).
     Block &elseBlock = lastIf.getElseRegion().front();
-    buildElseYieldForLastIf(groups[lastGi].blockId, otherCtx, lastIfTypes,
-                            elseBlock, loc, builder);
+    buildElseYieldForLastIf(otherCtx, lastIfTypes, elseBlock, loc, builder);
 
     // Replace original if's uses with last-if's results.
     for (unsigned ri = 0; ri < ya.numOriginalSlots; ++ri) {
@@ -1637,13 +1619,13 @@ static void materializeCandidate(CandidateIf &c, OpBuilder &builder,
 
     builder.setInsertionPointAfter(lastCreatedIf);
     bool hasElse = otherCtx.hasOps;
-    lastIf = builder.create<scf::IfOp>(loc, condition, hasElse);
-    lastIf->setAttr(CVPipeline::kBlockId,
-                    builder.getI32IntegerAttr(groups[lastGi].blockId));
-    if (lastIf.getThenRegion().empty()) {
-      lastIf.getThenRegion().emplaceBlock();
+    auto voidIf = builder.create<scf::IfOp>(loc, condition, hasElse);
+    voidIf->setAttr(CVPipeline::kBlockId,
+                    builder.getI32IntegerAttr(bm.getNextId()));
+    if (voidIf.getThenRegion().empty()) {
+      voidIf.getThenRegion().emplaceBlock();
     }
-    Block &thenBlock = lastIf.getThenRegion().front();
+    Block &thenBlock = voidIf.getThenRegion().front();
     if (thenBlock.mightHaveTerminator()) {
       thenBlock.getTerminator()->erase();
     }
@@ -1655,10 +1637,10 @@ static void materializeCandidate(CandidateIf &c, OpBuilder &builder,
 
     // Scene 3/4: else block absorbs other side's ops.
     if (hasElse) {
-      if (lastIf.getElseRegion().empty()) {
-        lastIf.getElseRegion().emplaceBlock();
+      if (voidIf.getElseRegion().empty()) {
+        voidIf.getElseRegion().emplaceBlock();
       }
-      Block &elseBlock = lastIf.getElseRegion().front();
+      Block &elseBlock = voidIf.getElseRegion().front();
       if (elseBlock.mightHaveTerminator()) {
         elseBlock.getTerminator()->erase();
       }
@@ -1671,7 +1653,6 @@ static void materializeCandidate(CandidateIf &c, OpBuilder &builder,
       builder.create<scf::YieldOp>(loc);
     }
   }
-  lastIf->setAttr(kSplittedIf, builder.getUnitAttr());
 
   // Erase the original if.
   originalIf->erase();
@@ -1716,91 +1697,6 @@ static void materializeCandidates(SmallVector<CandidateIf> &candidates,
   changed = true;
 }
 
-static void rearrangeIfOps(scf::IfOp ifOp,
-                           CVPipeline::MemoryDependenceGraph &memGraph) {
-  Operation *lastDependency = nullptr;
-  Block *block = ifOp->getBlock();
-  ifOp->walk([&](Operation *nestedOp) {
-    for (Value operand : nestedOp->getOperands()) {
-      auto defOp = operand.getDefiningOp();
-      if (!defOp || ifOp->isAncestor(defOp)) {
-        continue;
-      }
-      auto defOpInBlock = block->findAncestorOpInBlock(*defOp);
-      if (!defOpInBlock) {
-        continue;
-      }
-      if (!lastDependency || lastDependency->isBeforeInBlock(defOpInBlock)) {
-        lastDependency = defOpInBlock;
-      }
-    }
-  });
-  for (auto *memDep : memGraph.getExecBefore(ifOp)) {
-    auto depInBlock = block->findAncestorOpInBlock(*memDep);
-    if (!depInBlock) {
-      continue;
-    }
-    if (!lastDependency || lastDependency->isBeforeInBlock(depInBlock)) {
-      lastDependency = depInBlock;
-    }
-  }
-  if (lastDependency) {
-    ifOp->moveAfter(lastDependency);
-  }
-}
-
-// collet all main loops
-static SmallVector<scf::ForOp> getMainLoops(ModuleOp moduleOp) {
-  SmallVector<scf::ForOp> mainLoops;
-  moduleOp.walk([&mainLoops](scf::ForOp forOp) {
-    if (llvm::any_of(mainLoops, [forOp](scf::ForOp mainLoop) {
-          return forOp->isAncestor(mainLoop);
-        })) {
-      return;
-    }
-    CVPipeline::CoreType allCt = CVPipeline::UNDETERMINED;
-    auto result = forOp->walk([&allCt](Operation *op) {
-      allCt = static_cast<CVPipeline::CoreType>(allCt |
-                                                CVPipeline::getOpCoreType(op));
-      if (allCt == mlir::CVPipeline::CUBE_AND_VECTOR) {
-        return WalkResult::interrupt();
-      }
-      return WalkResult::advance();
-    });
-    if (result.wasInterrupted()) {
-      mainLoops.push_back(forOp);
-    }
-  });
-  return mainLoops;
-}
-
-namespace {
-
-class SplitIfByBlockIdPass
-    : public PassWrapper<SplitIfByBlockIdPass, OperationPass<ModuleOp>> {
-public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SplitIfByBlockIdPass)
-
-  SplitIfByBlockIdPass() = default;
-
-  void runOnOperation() override;
-
-  llvm::StringRef getArgument() const final { return "split-if-by-block-id"; }
-
-  llvm::StringRef getDescription() const final {
-    return "Split scf.if operations so that each if contains only ops of a "
-           "single block_id";
-  }
-
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<arith::ArithDialect, bufferization::BufferizationDialect,
-                    linalg::LinalgDialect, memref::MemRefDialect,
-                    scf::SCFDialect, tensor::TensorDialect>();
-  }
-};
-
-} // namespace
-
 // ============================================================================
 // Pass entry point
 // ============================================================================
@@ -1813,14 +1709,12 @@ void SplitIfByBlockIdPass::runOnOperation() {
   LDBG("//===--- Before SplitIfByBlockId ---\n" << module);
   LDBG("//===--- End Before SplitIfByBlockId ---");
 
-  auto mainLoops = getMainLoops(module);
-
   bool changed = true;
   for (unsigned iteration = 1; changed; ++iteration) {
     changed = false;
 
     // Part1: Discovery & Grouping
-    auto candidates = discoverCandidates(mainLoops);
+    auto candidates = discoverCandidates(module);
     LDBG("  iter=" << iteration << "  candidates=" << candidates.size());
 
     if (candidates.empty()) {
@@ -1837,15 +1731,6 @@ void SplitIfByBlockIdPass::runOnOperation() {
     CVPipeline::ComputeBlockIdManager bm(module);
     materializeCandidates(candidates, changed, bm);
   }
-
-  auto &aa = getAnalysis<AliasAnalysis>();
-  CVPipeline::MemoryDependenceGraph memGraph{module, aa};
-  module->walk([&](scf::IfOp ifOp) {
-    if (ifOp->hasAttr(kSplittedIf)) {
-      rearrangeIfOps(ifOp, memGraph);
-      ifOp->removeAttr(kSplittedIf);
-    }
-  });
 
   // Dump the post-split IR in debug builds
   LDBG("//===--- After SplitIfByBlockId ---\n" << module);
@@ -1865,8 +1750,17 @@ std::unique_ptr<OperationPass<ModuleOp>> createSplitIfByBlockIdPass() {
   return std::make_unique<SplitIfByBlockIdPass>();
 }
 
-void registerSplitIfByBlockIdPass() {
-  registerPass(createSplitIfByBlockIdPass);
+void registerSplitIfByBlockIdPasses() {
+  registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return createSplitIfByBlockIdPass();
+  });
+}
+
+void SplitIfByBlockIdPass::getDependentDialects(
+    DialectRegistry &registry) const {
+  registry.insert<arith::ArithDialect, bufferization::BufferizationDialect,
+                  linalg::LinalgDialect, memref::MemRefDialect, scf::SCFDialect,
+                  tensor::TensorDialect>();
 }
 
 } // namespace triton
