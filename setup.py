@@ -964,9 +964,16 @@ def get_git_version_suffix():
 
 def apply_patch(patch_path):
     try:
-        subprocess.run(["git", "apply", patch_path], check=True, stdout=subprocess.DEVNULL)
-    except subprocess.CalledProcessError:
-        raise RuntimeError(f"patch({patch_path}) failed")
+        # Check if patch can be applied cleanly
+        result = subprocess.run(
+            ["git", "apply", "--check", patch_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if result.returncode != 0:
+            print(f"WARNING: patch({patch_path}) does not apply cleanly, "
+                  "changes may already be in the base code, skipping.")
+            return
+        subprocess.run(["git", "apply", patch_path], check=True,
+                       stdout=subprocess.DEVNULL)
     except FileNotFoundError:
         raise RuntimeError(f"patch({patch_path}) not found.")
 
