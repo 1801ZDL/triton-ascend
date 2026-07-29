@@ -781,26 +781,23 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
       LOG_DEBUG("Found scalar V->C dependency from forOp bounds: "
                 << bound << "\n");
 
-      // Record a V->C dependency for each CUBE block that consumes this scalar.
-      llvm::DenseSet<int> handledConsumers;
-      for (mlir::Operation *user : bound.getUsers()) {
-        auto consumerIdOpt = CVPipeline::getOpBlockId(user);
-        if (!consumerIdOpt) {
-          continue;
-        }
-        int consumerId = *consumerIdOpt;
-        auto it = blockInfoMap.find(consumerId);
-        if (it == blockInfoMap.end() || !it->second.isCube) {
-          continue;
-        }
-        if (!handledConsumers.insert(consumerId).second) {
-          continue;
-        }
-
-        collectDepInfo(bound, DependencyType::VectorToCube, v2cDependencies,
-                       producerId, consumerId, info);
-        v2cDependencies.back().isScaler = true;
+      // Record a single V->C dependency using the for-loop op's own block_id
+      // as the consumer.  The bound is also used by ops inside the loop body,
+      // but those are in the same CUBE scope after CV separation and will use
+      // the transferred value via normal SSA dominance — no separate transfer
+      // needed per inner consumer.
+      auto forBlockIdOpt = CVPipeline::getOpBlockId(forOp.getOperation());
+      if (!forBlockIdOpt) {
+        continue;
       }
+      int forBlockId = *forBlockIdOpt;
+      auto it = blockInfoMap.find(forBlockId);
+      if (it == blockInfoMap.end() || !it->second.isCube) {
+        continue;
+      }
+      collectDepInfo(bound, DependencyType::VectorToCube, v2cDependencies,
+                     producerId, forBlockId, info);
+      v2cDependencies.back().isScaler = true;
       handledScalarValues.insert(bound);
     }
   });
