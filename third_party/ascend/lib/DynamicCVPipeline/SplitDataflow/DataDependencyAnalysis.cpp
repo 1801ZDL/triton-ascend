@@ -740,6 +740,11 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
   // available on the CUBE side after SSBuffer transfer.
   llvm::DenseSet<mlir::Value> handledScalarValues;
 
+  // For-loops whose bounds have been handled — ifOp conditions inside these
+  // loops will be computable on CUBE via the induction variable after the
+  // bounds are transferred, so they don't need separate scalar deps.
+  llvm::DenseSet<scf::ForOp> handledForOps;
+
   LOG_DEBUG("Analyzing scalar V->C dependencies from control flow ops...\n");
 
   // ---- scf.for loop bounds ----
@@ -781,6 +786,11 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
       LOG_DEBUG("Found scalar V->C dependency from forOp bounds: "
                 << bound << "\n");
 
+      // Mark this for-loop as handled so that ifOp conditions nested inside
+      // it are skipped — they will be computable on CUBE via the induction
+      // variable once the bounds are transferred.
+      handledForOps.insert(forOp);
+
       // Record a single V->C dependency using the for-loop op's own block_id
       // as the consumer.  The bound is also used by ops inside the loop body,
       // but those are in the same CUBE scope after CV separation and will use
@@ -806,6 +816,19 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
   module.walk([&](scf::IfOp ifOp) {
     if (!ifOpHasCubeOps(ifOp, blockInfoMap)) {
       return;
+    }
+
+    // Skip if this ifOp is nested inside a for-loop whose bounds have already
+    // been transferred.  The induction variable carries the transferred values,
+    // so any scalar condition computed from it is already available on CUBE.
+    mlir::Operation *parent = ifOp->getParentOp();
+    while (parent) {
+      if (auto parentForOp = dyn_cast<scf::ForOp>(parent)) {
+        if (handledForOps.contains(parentForOp)) {
+          return;
+        }
+      }
+      parent = parent->getParentOp();
     }
 
     mlir::Value condition = ifOp.getCondition();
