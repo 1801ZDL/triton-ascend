@@ -57,7 +57,13 @@ inline constexpr llvm::StringLiteral kAnalyzeFlagId =
 inline constexpr llvm::StringLiteral kLoopCarriedL0C =
     "ssbuffer.loop_carried_l0c";
 inline constexpr llvm::StringLiteral kCrossCoreDeps = "ssbuffer.crossCoreDeps";
+inline constexpr llvm::StringLiteral kTightlyCoupledBufferAttr =
+    "hivm.tightly_coupled_buffer";
 inline constexpr llvm::StringLiteral kIntraDeps = "ssbuffer.intraDeps";
+// Marks a whileOp whose last iter-arg is an i32 iteration counter. Set by
+// whoever injects the counter (InnerScope or OuterScope fallback) so the
+// other pass can reuse it instead of double-injecting.
+inline constexpr llvm::StringLiteral kIterCounter = "ssbuffer.iter_counter";
 inline constexpr llvm::StringLiteral kMemCrossDeps = "ssbuffer.memCrossDeps";
 inline constexpr llvm::StringLiteral kMayNotExec = "ssbuffer.may_not_exec";
 inline constexpr llvm::StringLiteral kClone = "ssbuffer.clone";
@@ -69,8 +75,7 @@ static constexpr llvm::StringLiteral kInlinableQuantScaleAttr =
     "enable_fast_tf32_mul";
 inline constexpr llvm::StringLiteral kHIVMMatmulLimitedInCubeAttr =
     "hivm.matmul_limited_in_cube";
-inline constexpr llvm::StringLiteral kTightlyCoupledBufferAttr =
-    "hivm.tightly_coupled_buffer";
+
 inline constexpr llvm::StringLiteral kCoreTypeCube = "CUBE";
 inline constexpr llvm::StringLiteral kCoreTypeVector = "VECTOR";
 

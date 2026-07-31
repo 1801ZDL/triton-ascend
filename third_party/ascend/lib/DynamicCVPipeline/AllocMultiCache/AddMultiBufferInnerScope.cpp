@@ -1916,6 +1916,9 @@ setupWhileIterArgCounter(const MainLoop &loop, OpBuilder &builder) {
   for (auto attr : oldWhile->getAttrs())
     newWhile->setAttr(attr.getName(), attr.getValue());
 
+  // Mark the counter so OuterScope can reuse it instead of double-injecting.
+  newWhile->setAttr(kIterCounter, builder.getUnitAttr());
+
   for (unsigned i = 0, e = oldWhile.getNumResults(); i < e; ++i)
     oldWhile.getResult(i).replaceAllUsesWith(newWhile.getResult(i));
   oldWhile.erase();

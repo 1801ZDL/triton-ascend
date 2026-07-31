@@ -28,6 +28,10 @@ static constexpr const char *DEBUG_TYPE = "AddMultiBufferOuterScope";
 using namespace mlir;
 using namespace triton;
 using namespace hivm;
+using namespace CVPipeline;
+
+// Local constexpr for attrs not (yet) in Utils.h
+static constexpr llvm::StringLiteral kCrossBuffer = "ssbuffer.cross_buffer";
 
 namespace mlir {
 namespace triton {
@@ -52,13 +56,13 @@ static int getFlagFromSyncOp(Operation *op) {
 }
 
 static int getBlockId(Operation *op) {
-  if (auto attr = op->getAttrOfType<IntegerAttr>(mlir::CVPipeline::kBlockId))
+  if (auto attr = op->getAttrOfType<IntegerAttr>(kBlockId))
     return attr.getInt();
   return -1;
 }
 
 static int getTransferId(Operation *op) {
-  if (auto attr = op->getAttrOfType<IntegerAttr>(mlir::CVPipeline::kTransferId))
+  if (auto attr = op->getAttrOfType<IntegerAttr>(kTransferId))
     return attr.getInt();
   return -1;
 }
@@ -77,47 +81,11 @@ static bool isInVectorScope(Operation *op) {
 
 // --- main_loop attribute helpers ---
 
-/// Check if a loop op (ForOp or WhileOp) has ssbuffer.main_loop attribute
-static bool loopOpHasMainLoopAttr(Operation *op) {
-  if (op->hasAttr("ssbuffer.main_loop")) {
-    return true;
-  }
-  // Check terminators
-  if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-    Operation *term = forOp.getBody()->getTerminator();
-    return term && term->hasAttr("ssbuffer.main_loop");
-  }
-  if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
-    // Check both before and after region terminators
-    Block &before = whileOp.getBefore().front();
-    if (auto *term = before.getTerminator()) {
-      if (term->hasAttr("ssbuffer.main_loop")) {
-        return true;
-      }
-    }
-    Block &after = whileOp.getAfter().front();
-    if (auto *term = after.getTerminator()) {
-      if (term->hasAttr("ssbuffer.main_loop")) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
 /// Check if a sync op's direct parent has ssbuffer.main_loop attribute
 static bool parentOpHasMainLoopAttr(Operation *syncOp) {
-  if (!syncOp) {
+  if (!syncOp)
     return false;
-  }
-  Operation *parent = syncOp->getParentOp();
-  if (!parent) {
-    return false;
-  }
-  if (isa<scf::ForOp, scf::WhileOp>(parent)) {
-    return loopOpHasMainLoopAttr(parent);
-  }
-  return false;
+  return isMainLoopOp(syncOp->getParentOp());
 }
 
 // --- Operation search helpers ---
@@ -192,7 +160,7 @@ static int
 collectOpsByTransferId(ModuleOp module,
                        DenseMap<int, SmallVector<Operation *>> &opsByTid) {
   module.walk([&](Operation *op) {
-    if (!op->hasAttr(mlir::CVPipeline::kTransferId)) {
+    if (!op->hasAttr(kTransferId)) {
       return;
     }
     int tid = getTransferId(op);
@@ -301,7 +269,7 @@ static int collectBufferAllocs(const SmallVector<Operation *> &ops,
 static int collectLoadStoreOpsByTransferId(
     ModuleOp module, DenseMap<int, SmallVector<Operation *>> &loadStoreByTid) {
   module.walk([&](Operation *op) {
-    if (!op->hasAttr(mlir::CVPipeline::kTransferId)) {
+    if (!op->hasAttr(kTransferId)) {
       return;
     }
     int tid = getTransferId(op);
@@ -332,7 +300,7 @@ static int tagLoadStoreOpsWithCrossDeps(
         Value ptr = storeOp.getOperand(1);
         if (auto *ptrDefOp = ptr.getDefiningOp()) {
           ptrDefOp->setAttr(
-              mlir::CVPipeline::kCrossCoreDeps,
+              kCrossCoreDeps,
               builder.getArrayAttr({builder.getI32IntegerAttr(tid),
                                     builder.getI32IntegerAttr(1)}));
           LDBG("Tagged ptr-defining-op with crossDeps={tid=" << tid << ", 1}");
@@ -340,7 +308,7 @@ static int tagLoadStoreOpsWithCrossDeps(
       } else if (auto loadOp = dyn_cast<mlir::LLVM::LoadOp>(op)) {
         // consumer: crossDeps = {tid, 0}
         // Tag the load op itself
-        op->setAttr(mlir::CVPipeline::kCrossCoreDeps,
+        op->setAttr(kCrossCoreDeps,
                     builder.getArrayAttr({builder.getI32IntegerAttr(tid),
                                           builder.getI32IntegerAttr(0)}));
         LDBG("Tagged llvm.load volatile with crossDeps={tid=" << tid << ", 0}");
@@ -621,9 +589,9 @@ static int createOutputBufferPair(Operation *inputAllocOp, int tid, int tcbId,
 
   builder.setInsertionPointAfter(inputAllocOp);
   auto outputAlloc = builder.create<memref::AllocOp>(loc, memRefType);
-  outputAlloc->setAttr(mlir::CVPipeline::kBlockId,
+  outputAlloc->setAttr(kBlockId,
                        builder.getI32IntegerAttr(outputBlockId));
-  outputAlloc->setAttr(mlir::CVPipeline::kTransferId,
+  outputAlloc->setAttr(kTransferId,
                        builder.getI32IntegerAttr(tid));
   outputBuffer = outputAlloc.getResult();
 
@@ -635,9 +603,9 @@ static int createOutputBufferPair(Operation *inputAllocOp, int tid, int tcbId,
 
   auto outputMark = builder.create<annotation::MarkOp>(loc, outputBuffer);
   outputMark->setAttr("effects", builder.getStrArrayAttr({"write", "read"}));
-  outputMark->setAttr(mlir::CVPipeline::kBlockId,
+  outputMark->setAttr(kBlockId,
                       builder.getI32IntegerAttr(outputBlockId));
-  outputMark->setAttr(mlir::CVPipeline::kTransferId,
+  outputMark->setAttr(kTransferId,
                       builder.getI32IntegerAttr(tid));
   outputMark->setAttr(
       "hivm.tightly_coupled_buffer",
@@ -652,11 +620,11 @@ static constexpr unsigned kBits32 = 32;
 
 static int attachSsbufferTags(Operation *op, int blockId, int transferId) {
   MLIRContext *ctx = op->getContext();
-  op->setAttr(mlir::CVPipeline::kBlockId,
+  op->setAttr(kBlockId,
               IntegerAttr::get(IntegerType::get(ctx, kBits32), blockId));
-  op->setAttr(mlir::CVPipeline::kTransferId,
+  op->setAttr(kTransferId,
               IntegerAttr::get(IntegerType::get(ctx, kBits32), transferId));
-  op->setAttr("ssbuffer.analyze_flag_id", UnitAttr::get(ctx));
+  op->setAttr(kAnalyzeFlagId, UnitAttr::get(ctx));
   return 0;
 }
 
@@ -772,13 +740,13 @@ static int addConsumerCrossDepsTags(TransferGroupInfo &g, ModuleOp module) {
 
   if (consumerBuf.allocOp) {
     consumerBuf.allocOp->setAttr(
-        mlir::CVPipeline::kCrossCoreDeps,
+        kCrossCoreDeps,
         builder.getArrayAttr(
             {builder.getI32IntegerAttr(g.tid), builder.getI32IntegerAttr(1)}));
   }
   if (consumerChain.transferOp) {
     consumerChain.transferOp->setAttr(
-        mlir::CVPipeline::kCrossCoreDeps,
+        kCrossCoreDeps,
         builder.getArrayAttr(
             {builder.getI32IntegerAttr(g.tid), builder.getI32IntegerAttr(0)}));
   }
@@ -792,126 +760,90 @@ static int addConsumerCrossDepsTags(TransferGroupInfo &g, ModuleOp module) {
 /// Set ssbuffer tags on an op
 static int setSsbufferTags(Operation *op, OpBuilder &builder, int blockId,
                            int tid) {
-  op->setAttr(mlir::CVPipeline::kBlockId, builder.getI32IntegerAttr(blockId));
-  op->setAttr(mlir::CVPipeline::kTransferId, builder.getI32IntegerAttr(tid));
+  op->setAttr(kBlockId, builder.getI32IntegerAttr(blockId));
+  op->setAttr(kTransferId, builder.getI32IntegerAttr(tid));
   return 0;
 }
 
-/// Ensure a WhileOp has a toggle i1 loop-carried variable for polling.
-/// Returns the after-block argument that serves as the polling condition
-/// (false = use input buffer, true = use output buffer).
-/// Idempotent: if toggle already added (detected by attribute), return it.
-static Value ensureWhileOpHasToggle(scf::WhileOp whileOp) {
-  // Check if already processed
-  if (whileOp->hasAttr("ssbuffer.polling_toggle")) {
+/// Ensure a WhileOp has an i32 iteration counter loop-carried variable.
+/// Returns the counter Value; polling condition is (counter % 2) == 0.
+/// Uses the Builder callback API, matching InnerScope's setupWhileIterArgCounter.
+/// Reuses an existing counter (e.g. one injected by InnerScope, detected via
+/// kIterCounter); injects a new one only when absent.
+static Value ensureWhileOpHasCounter(scf::WhileOp whileOp) {
+  if (whileOp->hasAttr(kIterCounter)) {
     Block &after = whileOp.getAfter().front();
     return after.getArgument(after.getNumArguments() - 1);
   }
 
   OpBuilder builder(whileOp);
   Location loc = whileOp.getLoc();
+  auto oldWhile = whileOp;
+  Type i32Type = builder.getI32Type();
 
-  // Create initial toggle value: false (even iteration → input buffer)
-  Value cFalse = builder.create<arith::ConstantIntOp>(loc, false, 1);
+  // Init counter = 0
+  Value zero = builder.create<arith::ConstantIntOp>(loc, 0, 32);
 
-  // Collect existing types and values, appending the i1 toggle
-  SmallVector<Value> newInits(whileOp.getInits());
-  newInits.push_back(cFalse);
+  SmallVector<Value> newInits(oldWhile.getInits());
+  newInits.push_back(zero);
+  SmallVector<Type> newResultTypes(oldWhile.getResultTypes());
+  newResultTypes.push_back(i32Type);
 
-  SmallVector<Type> newResultTypes(whileOp.getResultTypes());
-  Type i1Type = builder.getI1Type();
-  newResultTypes.push_back(i1Type);
+  Value counterIterArg;
 
-  // Build before/after block arg types
-  Block &oldBefore = whileOp.getBefore().front();
-  SmallVector<Type> beforeArgTypes;
-  for (BlockArgument arg : oldBefore.getArguments())
-    beforeArgTypes.push_back(arg.getType());
-  beforeArgTypes.push_back(i1Type);
+  // Use Builder callback API (matching InnerScope setupWhileIterArgCounter)
+  auto newWhile = builder.create<scf::WhileOp>(
+      loc, newResultTypes, newInits,
+      [&](OpBuilder &bb, Location bl, ValueRange iterArgs) {
+        Block *oldBefore = oldWhile.getBeforeBody();
+        unsigned n = oldBefore->getNumArguments();
+        IRMapping map;
+        for (unsigned i = 0; i < n; ++i)
+          map.map(oldBefore->getArgument(i), iterArgs[i]);
 
-  Block &oldAfter = whileOp.getAfter().front();
-  SmallVector<Type> afterArgTypes;
-  for (BlockArgument arg : oldAfter.getArguments())
-    afterArgTypes.push_back(arg.getType());
-  afterArgTypes.push_back(i1Type);
+        for (Operation &op : oldBefore->without_terminator())
+          bb.clone(op, map);
 
-  // Create new WhileOp
-  auto newWhile = builder.create<scf::WhileOp>(loc, newResultTypes, newInits);
+        auto oldCond = cast<scf::ConditionOp>(oldBefore->getTerminator());
+        SmallVector<Value> condArgs;
+        for (Value a : oldCond.getArgs())
+          condArgs.push_back(map.lookupOrDefault(a));
+        condArgs.push_back(iterArgs[n]); // counter
+        bb.create<scf::ConditionOp>(bl, map.lookupOrDefault(oldCond.getCondition()),
+                                    condArgs);
+      },
+      [&](OpBuilder &ab, Location al, ValueRange iterArgs) {
+        Block *oldAfter = oldWhile.getAfterBody();
+        unsigned n = oldAfter->getNumArguments();
+        counterIterArg = iterArgs[n];
+        IRMapping map;
+        for (unsigned i = 0; i < n; ++i)
+          map.map(oldAfter->getArgument(i), iterArgs[i]);
 
-  // Replace builder-created placeholder blocks with explicit-typed blocks
-  newWhile.getBefore().getBlocks().clear();
-  newWhile.getAfter().getBlocks().clear();
-  SmallVector<Location> beforeLocs(beforeArgTypes.size(), loc);
-  SmallVector<Location> afterLocs(afterArgTypes.size(), loc);
-  Block *newBefore = builder.createBlock(&newWhile.getBefore(),
-                                         newWhile.getBefore().end(),
-                                         beforeArgTypes, beforeLocs);
-  Block *newAfter = builder.createBlock(&newWhile.getAfter(),
-                                        newWhile.getAfter().end(),
-                                        afterArgTypes, afterLocs);
+        for (Operation &op : oldAfter->without_terminator())
+          ab.clone(op, map);
 
-  // --- Clone before region ---
-  IRMapping beforeMap;
-  for (unsigned i = 0; i < oldBefore.getNumArguments(); ++i)
-    beforeMap.map(oldBefore.getArgument(i), newBefore->getArgument(i));
+        auto oldYield = cast<scf::YieldOp>(oldAfter->getTerminator());
+        Value one = ab.create<arith::ConstantIntOp>(al, 1, 32);
+        Value nextCounter = ab.create<arith::AddIOp>(al, counterIterArg, one);
+        SmallVector<Value> yOps;
+        for (Value v : oldYield.getOperands())
+          yOps.push_back(map.lookupOrDefault(v));
+        yOps.push_back(nextCounter);
+        ab.create<scf::YieldOp>(al, yOps);
+      });
 
-  builder.setInsertionPointToStart(newBefore);
-  for (Operation &op : oldBefore.without_terminator())
-    builder.clone(op, beforeMap);
+  // Copy attrs and mark as processed
+  for (auto attr : oldWhile->getAttrs())
+    newWhile->setAttr(attr.getName(), attr.getValue());
+  newWhile->setAttr(kIterCounter, builder.getUnitAttr());
 
-  // Re-create scf.condition: forward the toggle as extra operand
-  auto oldCond = cast<scf::ConditionOp>(oldBefore.getTerminator());
-  builder.setInsertionPointToEnd(newBefore);
-  SmallVector<Value> condArgs;
-  for (Value arg : oldCond.getArgs())
-    condArgs.push_back(beforeMap.lookupOrDefault(arg));
-  Value toggleArgBefore = newBefore->getArgument(newBefore->getNumArguments() - 1);
-  condArgs.push_back(toggleArgBefore);
-  Value mappedCond = beforeMap.lookupOrDefault(oldCond.getCondition());
-  builder.create<scf::ConditionOp>(loc, mappedCond, condArgs);
+  // Replace results (exclude counter result)
+  for (unsigned i = 0, e = oldWhile.getNumResults(); i < e; ++i)
+    oldWhile.getResult(i).replaceAllUsesWith(newWhile.getResult(i));
+  oldWhile.erase();
 
-  // --- Clone after region ---
-  IRMapping afterMap;
-  for (unsigned i = 0; i < oldAfter.getNumArguments(); ++i)
-    afterMap.map(oldAfter.getArgument(i), newAfter->getArgument(i));
-
-  builder.setInsertionPointToStart(newAfter);
-  for (Operation &op : oldAfter.without_terminator())
-    builder.clone(op, afterMap);
-
-  // Flip toggle and append to yield
-  auto oldYield = cast<scf::YieldOp>(oldAfter.getTerminator());
-  builder.setInsertionPointToEnd(newAfter);
-
-  Value toggleArgAfter = newAfter->getArgument(newAfter->getNumArguments() - 1);
-  Value cTrue = builder.create<arith::ConstantIntOp>(loc, true, 1);
-  Value nextToggle = builder.create<arith::XOrIOp>(loc, toggleArgAfter, cTrue);
-
-  SmallVector<Value> yieldOps;
-  for (Value op : oldYield.getOperands())
-    yieldOps.push_back(afterMap.lookupOrDefault(op));
-  yieldOps.push_back(nextToggle);
-  builder.create<scf::YieldOp>(loc, yieldOps);
-
-  // Copy ssbuffer-prefixed attributes from old whileOp to new whileOp
-  for (auto namedAttr : whileOp->getAttrs()) {
-    if (namedAttr.getName().strref().starts_with("ssbuffer"))
-      newWhile->setAttr(namedAttr.getName(), namedAttr.getValue());
-  }
-  // Mark as processed to prevent re-injection
-  newWhile->setAttr("ssbuffer.polling_toggle", builder.getUnitAttr());
-
-  // Replace old while: map first N results only (exclude toggle)
-  SmallVector<Value> newResults(newWhile.getResults().begin(),
-                                newWhile.getResults().end());
-  newResults.pop_back(); // remove the toggle result
-  for (auto [oldRes, newRes] :
-       llvm::zip(whileOp.getResults(), newResults))
-    oldRes.replaceAllUsesWith(newRes);
-  whileOp->erase();
-
-  // Return after-block toggle arg as the polling condition
-  return newAfter->getArgument(newAfter->getNumArguments() - 1);
+  return counterIterArg;
 }
 
 /// Create polling condition: (iter / step) % 2 == 0 (true=input, false=output)
@@ -957,9 +889,9 @@ static Operation *wrapSyncOpWithScfIf(
   Location loc = op->getLoc();
   auto ifOp = builder.create<scf::IfOp>(loc, TypeRange{}, cond,
                                         true /* withElseRegion */);
-  ifOp->setAttr(mlir::CVPipeline::kBlockId,
+  ifOp->setAttr(kBlockId,
                 builder.getI32IntegerAttr(getBlockId(op)));
-  ifOp->setAttr("ssbuffer.cross_buffer", builder.getI32IntegerAttr(1));
+  ifOp->setAttr(kCrossBuffer, builder.getI32IntegerAttr(1));
 
   // then branch: clone original op
   auto thenBuilder = ifOp.getThenBodyBuilder();
@@ -973,18 +905,18 @@ static Operation *wrapSyncOpWithScfIf(
   int bid = getBlockId(op);
   int tid = getTransferId(op);
   if (bid >= 0) {
-    cloned->setAttr(mlir::CVPipeline::kBlockId, builder.getI32IntegerAttr(bid));
-    altOp->setAttr(mlir::CVPipeline::kBlockId, builder.getI32IntegerAttr(bid));
+    cloned->setAttr(kBlockId, builder.getI32IntegerAttr(bid));
+    altOp->setAttr(kBlockId, builder.getI32IntegerAttr(bid));
   }
   if (tid >= 0) {
-    cloned->setAttr(mlir::CVPipeline::kTransferId,
+    cloned->setAttr(kTransferId,
                     builder.getI32IntegerAttr(tid));
-    altOp->setAttr(mlir::CVPipeline::kTransferId,
+    altOp->setAttr(kTransferId,
                    builder.getI32IntegerAttr(tid));
   }
-  if (op->hasAttr("ssbuffer.analyze_flag_id")) {
-    cloned->setAttr("ssbuffer.analyze_flag_id", builder.getUnitAttr());
-    altOp->setAttr("ssbuffer.analyze_flag_id", builder.getUnitAttr());
+  if (op->hasAttr(kAnalyzeFlagId)) {
+    cloned->setAttr(kAnalyzeFlagId, builder.getUnitAttr());
+    altOp->setAttr(kAnalyzeFlagId, builder.getUnitAttr());
   }
 
   op->replaceAllUsesWith(ifOp.getOperation());
@@ -1038,14 +970,14 @@ static Operation *wrapTransferOpWithScfIfYield(Operation *transferOp,
   if (isProducer) {
     auto crossDeps = builder.getArrayAttr(
         {builder.getI32IntegerAttr(tid), builder.getI32IntegerAttr(1)});
-    thenCloned->setAttr(mlir::CVPipeline::kCrossCoreDeps, crossDeps);
-    elseCloned->setAttr(mlir::CVPipeline::kCrossCoreDeps, crossDeps);
+    thenCloned->setAttr(kCrossCoreDeps, crossDeps);
+    elseCloned->setAttr(kCrossCoreDeps, crossDeps);
   }
 
   // Tag the ifOp
-  ifOp->setAttr(mlir::CVPipeline::kBlockId, builder.getI32IntegerAttr(bid));
-  ifOp->setAttr(mlir::CVPipeline::kTransferId, builder.getI32IntegerAttr(tid));
-  ifOp->setAttr("ssbuffer.cross_buffer", builder.getI32IntegerAttr(1));
+  ifOp->setAttr(kBlockId, builder.getI32IntegerAttr(bid));
+  ifOp->setAttr(kTransferId, builder.getI32IntegerAttr(tid));
+  ifOp->setAttr(kCrossBuffer, builder.getI32IntegerAttr(1));
 
   // Replace all uses of the original transferOp
   for (auto [oldResult, newResult] :
@@ -1094,14 +1026,14 @@ static Operation *wrapTransferOpWithScfIfSimple(Operation *transferOp,
   if (isProducer) {
     auto crossDeps = builder.getArrayAttr(
         {builder.getI32IntegerAttr(tid), builder.getI32IntegerAttr(1)});
-    thenCloned->setAttr(mlir::CVPipeline::kCrossCoreDeps, crossDeps);
-    elseCloned->setAttr(mlir::CVPipeline::kCrossCoreDeps, crossDeps);
+    thenCloned->setAttr(kCrossCoreDeps, crossDeps);
+    elseCloned->setAttr(kCrossCoreDeps, crossDeps);
   }
 
   // Tag the ifOp
-  ifOp->setAttr(mlir::CVPipeline::kBlockId, builder.getI32IntegerAttr(bid));
-  ifOp->setAttr(mlir::CVPipeline::kTransferId, builder.getI32IntegerAttr(tid));
-  ifOp->setAttr("ssbuffer.cross_buffer", builder.getI32IntegerAttr(1));
+  ifOp->setAttr(kBlockId, builder.getI32IntegerAttr(bid));
+  ifOp->setAttr(kTransferId, builder.getI32IntegerAttr(tid));
+  ifOp->setAttr(kCrossBuffer, builder.getI32IntegerAttr(1));
 
   transferOp->erase();
   return ifOp.getOperation();
@@ -1155,17 +1087,17 @@ static Operation *wrapReceiverChainWithScfIf(Operation *transferOp,
     // from the original (which may carry [tid, 0] from upstream tagging),
     // but consumer role is owned by the ifOp wrapper below. Inner clone
     // must stay clean.
-    clonedTransfer->removeAttr(mlir::CVPipeline::kCrossCoreDeps);
+    clonedTransfer->removeAttr(kCrossCoreDeps);
     Value chainResult = clonedTransfer->getResult(0);
     auto thenMapper = inputMap;
     thenMapper.map(transferOp->getResult(0), chainResult);
     for (Operation *op : trailingOps) {
       Operation *cloned = thenBuilder.clone(*op, thenMapper);
-      cloned->removeAttr(mlir::CVPipeline::kCrossCoreDeps);
+      cloned->removeAttr(kCrossCoreDeps);
       thenMapper.map(op->getResult(0), cloned->getResult(0));
     }
     Operation *clonedToTensor = thenBuilder.clone(*toTensorOp, thenMapper);
-    clonedToTensor->removeAttr(mlir::CVPipeline::kCrossCoreDeps);
+    clonedToTensor->removeAttr(kCrossCoreDeps);
     thenBuilder.create<scf::YieldOp>(loc, clonedToTensor->getResult(0));
   }
 
@@ -1177,25 +1109,25 @@ static Operation *wrapReceiverChainWithScfIf(Operation *transferOp,
       outputMap.map(transferOp->getOperand(transferOp->getNumOperands() - 1),
                     outputBuffer);
     Operation *clonedTransfer = elseBuilder.clone(*transferOp, outputMap);
-    clonedTransfer->removeAttr(mlir::CVPipeline::kCrossCoreDeps);
+    clonedTransfer->removeAttr(kCrossCoreDeps);
     Value chainResult = clonedTransfer->getResult(0);
     auto elseMapper = outputMap;
     elseMapper.map(transferOp->getResult(0), chainResult);
     for (Operation *op : trailingOps) {
       Operation *cloned = elseBuilder.clone(*op, elseMapper);
-      cloned->removeAttr(mlir::CVPipeline::kCrossCoreDeps);
+      cloned->removeAttr(kCrossCoreDeps);
       elseMapper.map(op->getResult(0), cloned->getResult(0));
     }
     Operation *clonedToTensor = elseBuilder.clone(*toTensorOp, elseMapper);
-    clonedToTensor->removeAttr(mlir::CVPipeline::kCrossCoreDeps);
+    clonedToTensor->removeAttr(kCrossCoreDeps);
     elseBuilder.create<scf::YieldOp>(loc, clonedToTensor->getResult(0));
   }
 
   // Tag the wrapper — single source of truth for consumer role
-  ifOp->setAttr(mlir::CVPipeline::kBlockId, builder.getI32IntegerAttr(bid));
-  ifOp->setAttr(mlir::CVPipeline::kTransferId, builder.getI32IntegerAttr(tid));
-  ifOp->setAttr("ssbuffer.cross_buffer", builder.getI32IntegerAttr(1));
-  ifOp->setAttr(mlir::CVPipeline::kCrossCoreDeps,
+  ifOp->setAttr(kBlockId, builder.getI32IntegerAttr(bid));
+  ifOp->setAttr(kTransferId, builder.getI32IntegerAttr(tid));
+  ifOp->setAttr(kCrossBuffer, builder.getI32IntegerAttr(1));
+  ifOp->setAttr(kCrossCoreDeps,
                 builder.getArrayAttr({builder.getI32IntegerAttr(tid),
                                       builder.getI32IntegerAttr(0)}));
 
@@ -1298,11 +1230,17 @@ static Value prepareLoopPolling(Operation *loopOp, Operation *waitOp,
   }
 
   if (auto whileOp = dyn_cast<scf::WhileOp>(loopOp)) {
-    // Toggle was already injected in preprocessing
+    // Counter was already injected in preprocessing.
+    // Polling condition: (counter % 2) == 0
     Block &after = whileOp.getAfter().front();
-    Value toggleArg = after.getArgument(after.getNumArguments() - 1);
+    Value counter = after.getArgument(after.getNumArguments() - 1);
     builderOut.setInsertionPoint(after.getTerminator());
-    return toggleArg;
+    OpBuilder condBuilder(builderOut);
+    Value c2 = condBuilder.create<arith::ConstantIntOp>(whileOp.getLoc(), 2, 32);
+    Value rem = condBuilder.create<arith::RemSIOp>(whileOp.getLoc(), counter, c2);
+    Value c0 = condBuilder.create<arith::ConstantIntOp>(whileOp.getLoc(), 0, 32);
+    return condBuilder.create<arith::CmpIOp>(
+        whileOp.getLoc(), arith::CmpIPredicate::eq, rem, c0);
   }
 
   llvm_unreachable("unexpected loop op type");
@@ -1365,11 +1303,11 @@ static int addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups) {
 static void preInjectWhileOpToggles(ModuleOp module) {
   SmallVector<scf::WhileOp> whileOps;
   module.walk([&](scf::WhileOp whileOp) {
-    if (!loopOpHasMainLoopAttr(whileOp))
+    if (!isMainLoopOp(whileOp))
       return;
     bool hasTransferOps = false;
     whileOp.walk([&](Operation *op) {
-      if (op->hasAttr("ssbuffer.transfer_id")) {
+      if (op->hasAttr(kTransferId)) {
         hasTransferOps = true;
         return WalkResult::interrupt();
       }
@@ -1380,7 +1318,7 @@ static void preInjectWhileOpToggles(ModuleOp module) {
   });
 
   for (auto whileOp : whileOps)
-    ensureWhileOpHasToggle(whileOp);
+    ensureWhileOpHasCounter(whileOp);
 
   LDBG("Preprocessed " << whileOps.size()
                         << " WhileOps with toggle injection");
