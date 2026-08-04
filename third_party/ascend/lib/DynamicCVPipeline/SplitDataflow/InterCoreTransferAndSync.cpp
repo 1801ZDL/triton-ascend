@@ -549,7 +549,15 @@ Operation *InterCoreTransferAndSyncPass::insertVectorToCubeTransfer(
   int cubeBlockId = CVPipeline::getOpBlockId(cubeStartOp).value_or(-1);
 
   if (isScaler) {
-    builder.setInsertionPointAfter(vectorEndOp);
+    // Insert the store right after srcValue's defining op (when it has one)
+    // so that the store dominates the load and the scalar consumers.  Falling
+    // back to vectorEndOp keeps behavior for block-argument / external values.
+    mlir::Operation *srcDefOp = srcValue.getDefiningOp();
+    if (srcDefOp) {
+      builder.setInsertionPointAfter(srcDefOp);
+    } else {
+      builder.setInsertionPointAfter(vectorEndOp);
+    }
     SmallVector<Operation *> writeOps;
     LOG_DEBUG("before writeToSSBuffer\n");
     auto addrOpt = ssbufferManager.writeToSSBuffer(srcValue, builder, writeOps);
@@ -570,7 +578,16 @@ Operation *InterCoreTransferAndSyncPass::insertVectorToCubeTransfer(
     attachCrossCoreDeps(sendOp, transferIndex, CVPipeline::crossCoreProducerId,
                         builder);
     LOG_DEBUG("before readFromSSBuffer\n");
-    builder.setInsertionPoint(cubeStartOp);
+    // Place the load after the store when both are in the same MLIR block,
+    // otherwise the load would read an uninitialized SSBuffer slot (store and
+    // load can share a block when producer block == consumer block).
+    if (sendOp && cubeStartOp &&
+        sendOp->getBlock() == cubeStartOp->getBlock() &&
+        !sendOp->isBeforeInBlock(cubeStartOp)) {
+      builder.setInsertionPointAfter(sendOp);
+    } else {
+      builder.setInsertionPoint(cubeStartOp);
+    }
     SmallVector<Operation *> readOps;
     auto loadedValueOpt =
         ssbufferManager.readFromSSBuffer(addr, builder, readOps);
@@ -654,6 +671,12 @@ Operation *InterCoreTransferAndSyncPass::insertVectorToCubeTransfer(
                                        srcValue.getUsers().end());
   for (Operation *user : users) {
     LOG_DEBUG("[v->c user]" << *user << "\n");
+    // Do not rewrite the store/send op itself: it must keep referencing the
+    // original srcValue, otherwise the value stored into SSBuffer would be the
+    // just-loaded receiveValue (a store→load self loop).
+    if (user == sendOp) {
+      continue;
+    }
     auto userBlockIdOpt = CVPipeline::getOpBlockId(user);
     if (userBlockIdOpt && *userBlockIdOpt == iniConsumerId) {
       user->replaceUsesOfWith(srcValue, receiveValue);

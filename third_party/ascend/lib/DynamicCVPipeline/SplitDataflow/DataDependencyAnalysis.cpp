@@ -123,7 +123,11 @@ bool DataDependencyAnalysisPass::isValid1DValueForDependency(
     mlir::Value value) {
   auto tensorTy = dyn_cast<TensorType>(value.getType());
   if (tensorTy && tensorTy.getRank() == SHAPE_1D_LENGTH) {
-    return true;
+    // 只有被 linalg.broadcast 消费的 1-D tensor 才视为有效跨核依赖。
+    // 被 tensor.extract 消费的 1-D tensor 会先被标量化，由标量 SSBuffer
+    // 依赖通道传递，不需要单独的 1-D tensor CopyOp。
+    return llvm::all_of(value.getUsers(),
+                        [](mlir::Operation *u) { return isa<linalg::BroadcastOp>(u); });
   }
   return false;
 }
@@ -747,6 +751,77 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
 
   LOG_DEBUG("Analyzing scalar V->C dependencies from control flow ops...\n");
 
+  // ---- tensor.extract ops ----
+  // Detect scalars extracted from VECTOR-produced tensors and consumed by CUBE
+  // blocks.  The extract result is the natural scalar dependency boundary:
+  // transferring it via SSBuffer avoids the need for 1-D tensor CopyOps.
+  module.walk([&](tensor::ExtractOp extractOp) {
+    mlir::Value sourceTensor = extractOp.getTensor();
+    mlir::Operation *tensorDefOp = sourceTensor.getDefiningOp();
+    if (!tensorDefOp) {
+      return;
+    }
+
+    // Only handle extracts whose source tensor is produced in a VECTOR block.
+    auto tensorBlockIdOpt = CVPipeline::getOpBlockId(tensorDefOp);
+    if (!tensorBlockIdOpt) {
+      return;
+    }
+    auto tensorBlockIt = blockInfoMap.find(*tensorBlockIdOpt);
+    if (tensorBlockIt == blockInfoMap.end() || tensorBlockIt->second.isCube) {
+      return;
+    }
+    // tensorDefOp must be a VECTOR-only op on tensor (e.g. math.floor/ceil).
+    if (!CVPipeline::isVectorOnlyOp(tensorDefOp)) {
+      return;
+    }
+
+    mlir::Value scalarResult = extractOp.getResult();
+    if (!isa<mlir::IntegerType, mlir::FloatType>(scalarResult.getType())) {
+      return;
+    }
+
+    // The scalar must be consumed in at least one CUBE block.
+    // Use the extract op's own block as the producer so the SSBuffer store can
+    // reference the extracted scalar (it must dominate the store insertion
+    // point).  The tensor source is in a VECTOR block, making this a V->C dep.
+    auto extractBlockIdOpt = CVPipeline::getOpBlockId(extractOp.getOperation());
+    int producerId = extractBlockIdOpt.value_or(*tensorBlockIdOpt);
+    llvm::DenseSet<int> handledConsumers;
+    bool hasCubConsumer = false;
+    for (mlir::Operation *user : scalarResult.getUsers()) {
+      auto userBlockIdOpt = CVPipeline::getOpBlockId(user);
+      if (!userBlockIdOpt) {
+        continue;
+      }
+      auto it = blockInfoMap.find(*userBlockIdOpt);
+      if (it != blockInfoMap.end() && it->second.isCube) {
+        hasCubConsumer = true;
+        if (handledConsumers.insert(*userBlockIdOpt).second) {
+          collectDepInfo(scalarResult, DependencyType::VectorToCube,
+                         v2cDependencies, producerId, *userBlockIdOpt, info);
+          v2cDependencies.back().isScaler = true;
+        }
+      }
+    }
+    if (hasCubConsumer) {
+      LOG_DEBUG("Found scalar V->C dependency from tensor.extract: "
+                << scalarResult << "\n");
+      handledScalarValues.insert(scalarResult);
+      // Mark any enclosing for-loop as handled: its bounds and any ifOp
+      // conditions inside derive from this transferred scalar, so they don't
+      // need separate transfers.
+      mlir::Operation *parent = extractOp->getParentOp();
+      while (parent) {
+        if (auto parentForOp = dyn_cast<scf::ForOp>(parent)) {
+          handledForOps.insert(parentForOp);
+          break;
+        }
+        parent = parent->getParentOp();
+      }
+    }
+  });
+
   // ---- scf.for loop bounds ----
   module.walk([&](scf::ForOp forOp) {
     if (!forOpHasCubeOps(forOp, blockInfoMap)) {
@@ -773,7 +848,19 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
       }
 
       llvm::DenseSet<mlir::Operation *> visited;
-      if (!hasVectorOpInDefChain(bound, visited, &handledScalarValues)) {
+      bool hasVectorDep =
+          hasVectorOpInDefChain(bound, visited, &handledScalarValues);
+      if (!hasVectorDep) {
+        // The trace may have been stopped by an already-handled scalar
+        // (e.g. a tensor.extract result transferred by the extract pass).
+        // In that case the bound itself needs no new transfer, but the
+        // enclosing loop still becomes "handled" so that ifOp conditions
+        // inside it are not redundantly detected.
+        llvm::DenseSet<mlir::Operation *> visitedNoStop;
+        if (!hasVectorOpInDefChain(bound, visitedNoStop)) {
+          continue;
+        }
+        handledForOps.insert(forOp);
         continue;
       }
 
