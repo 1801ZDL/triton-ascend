@@ -804,28 +804,20 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
           auto it = blockInfoMap.find(*userBlockIdOpt);
           if (it != blockInfoMap.end() && it->second.isCube) {
             usedInCube = true;
-            if (handledConsumers.insert(*userBlockIdOpt).second) {
-              collectDepInfo(scalarResult, DependencyType::VectorToCube,
-                             v2cDependencies, producerId, *userBlockIdOpt, info);
-              v2cDependencies.back().isScaler = true;
-            }
+            handledConsumers.insert(*userBlockIdOpt);
           }
         }
         if (!usedInCube) {
           // A for/if containing CUBE ops also counts as a CUBE consumer.
           if (auto forOp = dyn_cast<scf::ForOp>(user)) {
-            if (forOpHasCubeOps(forOp, blockInfoMap) && userBlockIdOpt &&
-                handledConsumers.insert(*userBlockIdOpt).second) {
-              collectDepInfo(scalarResult, DependencyType::VectorToCube,
-                             v2cDependencies, producerId, *userBlockIdOpt, info);
-              v2cDependencies.back().isScaler = true;
+            if (forOpHasCubeOps(forOp, blockInfoMap) && userBlockIdOpt) {
+              usedInCube = true;
+              handledConsumers.insert(*userBlockIdOpt);
             }
           } else if (auto ifOp = dyn_cast<scf::IfOp>(user)) {
-            if (ifOpHasCubeOps(ifOp, blockInfoMap) && userBlockIdOpt &&
-                handledConsumers.insert(*userBlockIdOpt).second) {
-              collectDepInfo(scalarResult, DependencyType::VectorToCube,
-                             v2cDependencies, producerId, *userBlockIdOpt, info);
-              v2cDependencies.back().isScaler = true;
+            if (ifOpHasCubeOps(ifOp, blockInfoMap) && userBlockIdOpt) {
+              usedInCube = true;
+              handledConsumers.insert(*userBlockIdOpt);
             }
           }
         }
@@ -841,6 +833,15 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
       }
     }
     if (hasCubConsumer) {
+      // Create a single dependency for this extract result.  All consumers
+      // share one SSBuffer store; one dep avoids duplicate stores (and the
+      // duplicate sync that can deadlock the cores).
+      if (!handledConsumers.empty()) {
+        int consumerId = *handledConsumers.begin();
+        collectDepInfo(scalarResult, DependencyType::VectorToCube,
+                       v2cDependencies, producerId, consumerId, info);
+        v2cDependencies.back().isScaler = true;
+      }
       LOG_DEBUG("Found scalar V->C dependency from tensor.extract: "
                 << scalarResult << "\n");
       handledScalarValues.insert(scalarResult);
