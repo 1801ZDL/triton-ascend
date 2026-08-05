@@ -781,26 +781,62 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
       return;
     }
 
-    // The scalar must be consumed in at least one CUBE block.
-    // Use the extract op's own block as the producer so the SSBuffer store can
-    // reference the extracted scalar (it must dominate the store insertion
-    // point).  The tensor source is in a VECTOR block, making this a V->C dep.
+    // The scalar must be consumed (directly or through a downstream pure
+    // scalar chain, e.g. fptosi/muli/subi producing loop bounds) in at least
+    // one CUBE block or in a for/if with CUBE content.
     auto extractBlockIdOpt = CVPipeline::getOpBlockId(extractOp.getOperation());
     int producerId = extractBlockIdOpt.value_or(*tensorBlockIdOpt);
+
     llvm::DenseSet<int> handledConsumers;
     bool hasCubConsumer = false;
-    for (mlir::Operation *user : scalarResult.getUsers()) {
-      auto userBlockIdOpt = CVPipeline::getOpBlockId(user);
-      if (!userBlockIdOpt) {
+    llvm::SmallVector<mlir::Value> worklist;
+    llvm::DenseSet<mlir::Value> visited;
+    worklist.push_back(scalarResult);
+    while (!worklist.empty()) {
+      mlir::Value cur = worklist.pop_back_val();
+      if (!visited.insert(cur).second) {
         continue;
       }
-      auto it = blockInfoMap.find(*userBlockIdOpt);
-      if (it != blockInfoMap.end() && it->second.isCube) {
-        hasCubConsumer = true;
-        if (handledConsumers.insert(*userBlockIdOpt).second) {
-          collectDepInfo(scalarResult, DependencyType::VectorToCube,
-                         v2cDependencies, producerId, *userBlockIdOpt, info);
-          v2cDependencies.back().isScaler = true;
+      for (mlir::Operation *user : cur.getUsers()) {
+        auto userBlockIdOpt = CVPipeline::getOpBlockId(user);
+        bool usedInCube = false;
+        if (userBlockIdOpt) {
+          auto it = blockInfoMap.find(*userBlockIdOpt);
+          if (it != blockInfoMap.end() && it->second.isCube) {
+            usedInCube = true;
+            if (handledConsumers.insert(*userBlockIdOpt).second) {
+              collectDepInfo(scalarResult, DependencyType::VectorToCube,
+                             v2cDependencies, producerId, *userBlockIdOpt, info);
+              v2cDependencies.back().isScaler = true;
+            }
+          }
+        }
+        if (!usedInCube) {
+          // A for/if containing CUBE ops also counts as a CUBE consumer.
+          if (auto forOp = dyn_cast<scf::ForOp>(user)) {
+            if (forOpHasCubeOps(forOp, blockInfoMap) && userBlockIdOpt &&
+                handledConsumers.insert(*userBlockIdOpt).second) {
+              collectDepInfo(scalarResult, DependencyType::VectorToCube,
+                             v2cDependencies, producerId, *userBlockIdOpt, info);
+              v2cDependencies.back().isScaler = true;
+            }
+          } else if (auto ifOp = dyn_cast<scf::IfOp>(user)) {
+            if (ifOpHasCubeOps(ifOp, blockInfoMap) && userBlockIdOpt &&
+                handledConsumers.insert(*userBlockIdOpt).second) {
+              collectDepInfo(scalarResult, DependencyType::VectorToCube,
+                             v2cDependencies, producerId, *userBlockIdOpt, info);
+              v2cDependencies.back().isScaler = true;
+            }
+          }
+        }
+        if (usedInCube) {
+          hasCubConsumer = true;
+          continue;
+        }
+        // Follow pure scalar compute chain (single-result, no regions).
+        if (user->getNumRegions() == 0 && user->getNumResults() == 1 &&
+            user->getResult(0).getType().isIntOrIndexOrFloat()) {
+          worklist.push_back(user->getResult(0));
         }
       }
     }
