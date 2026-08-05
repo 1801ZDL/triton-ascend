@@ -1096,12 +1096,7 @@ LogicalResult InterCoreTransferAndSyncPass::handleVectorToCube(
   auto [consStart, consEnd] = getBlockStartEnd(dep.consumerBlockId, module);
 
   Operation *consumedDataOp = nullptr;
-  // For scalar transfers, place the load at the start of the consumer block so
-  // the CUBE side completes the scalar load as early as possible and reaches
-  // the PIPE_S loop sync (flag 15) before the VECTOR side self-consumes the
-  // loop-start SET.  This avoids the VECTOR/CUBE flag-15 race that deadlocks
-  // the cores.
-  if (dep.consumerBlockId == dep.iniConsumerBlockId && !dep.isScaler) {
+  if (dep.consumerBlockId == dep.iniConsumerBlockId) {
     auto consumerPoint =
         analyzeConsumerReadInsertPoint(srcValue, dep.iniConsumerBlockId);
     if (consumerPoint) {
