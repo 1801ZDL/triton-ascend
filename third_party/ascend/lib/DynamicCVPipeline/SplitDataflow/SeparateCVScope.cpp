@@ -39,6 +39,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/RegionUtils.h"
 
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/SplitDataflow/SeparateCVScope.h"
@@ -952,6 +953,33 @@ static void cleanupSsbufferAttrs(Operation *rootOp) {
   rootOp->walk([](Operation *op) { removeSsbufferAttrs(op); });
 }
 
+// Iteratively erase use-free trivially-dead ops inside a scope.  When the
+// scalar dependency analysis transfers the boundary value (not the extract
+// result), the CUBE scope uses the loaded value directly, so the cloned
+// VECTOR-only chain (math.floor/ceil -> extract -> fptosi -> ...) becomes dead.
+// Removing it keeps VECTOR-only ops out of the CUBE scope.
+static void eraseTriviallyDeadOps(Operation *root) {
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    llvm::SmallVector<Operation *> toErase;
+    root->walk([&](Operation *op) {
+      if (op->getNumRegions() > 0) {
+        return;
+      }
+      if (op->use_empty() && mlir::wouldOpBeTriviallyDead(op)) {
+        toErase.push_back(op);
+      }
+    });
+    for (Operation *op : toErase) {
+      if (op->getBlock() && op->use_empty()) {
+        op->erase();
+        changed = true;
+      }
+    }
+  }
+}
+
 static LogicalResult separateScopes(func::FuncOp funcOp) {
   debugDumpOperation("before SeparateCVScope on func", funcOp.getOperation());
 
@@ -974,6 +1002,11 @@ static LogicalResult separateScopes(func::FuncOp funcOp) {
              funcOp.getName(), "'");
     return failure();
   }
+
+  // Drop leftover dead chains so VECTOR-only ops do not leak into the CUBE
+  // scope.
+  eraseTriviallyDeadOps(cubeScope.getOperation());
+  eraseTriviallyDeadOps(vecScope.getOperation());
 
   cleanupSsbufferAttrs(funcOp);
 

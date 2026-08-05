@@ -780,33 +780,95 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
     if (!isa<mlir::IntegerType, mlir::FloatType>(scalarResult.getType())) {
       return;
     }
-
-    // The scalar must be consumed in at least one CUBE block.
-    // Use the extract op's own block as the producer so the SSBuffer store can
-    // reference the extracted scalar (it must dominate the store insertion
-    // point).  The tensor source is in a VECTOR block, making this a V->C dep.
     auto extractBlockIdOpt = CVPipeline::getOpBlockId(extractOp.getOperation());
-    int producerId = extractBlockIdOpt.value_or(*tensorBlockIdOpt);
+
+    // Walk the downstream pure scalar compute chain (fptosi/muli/subi/addi)
+    // and find the FIRST value that is consumed by a CUBE block (or a for/if
+    // with CUBE content).  That value — which may be the extract result itself
+    // or a loop bound derived from it — is what actually needs to cross the
+    // core boundary.  Transferring it means the CUBE scope uses the loaded
+    // value directly and does not need the VECTOR-only chain feeding it.
+    mlir::Value transferValue;
     llvm::DenseSet<int> handledConsumers;
-    bool hasCubConsumer = false;
-    for (mlir::Operation *user : scalarResult.getUsers()) {
-      auto userBlockIdOpt = CVPipeline::getOpBlockId(user);
-      if (!userBlockIdOpt) {
+    llvm::SmallVector<mlir::Value> worklist;
+    llvm::DenseSet<mlir::Value> visited;
+    worklist.push_back(scalarResult);
+    while (!worklist.empty()) {
+      mlir::Value cur = worklist.pop_back_val();
+      if (!visited.insert(cur).second) {
         continue;
       }
-      auto it = blockInfoMap.find(*userBlockIdOpt);
-      if (it != blockInfoMap.end() && it->second.isCube) {
-        hasCubConsumer = true;
-        if (handledConsumers.insert(*userBlockIdOpt).second) {
-          collectDepInfo(scalarResult, DependencyType::VectorToCube,
-                         v2cDependencies, producerId, *userBlockIdOpt, info);
-          v2cDependencies.back().isScaler = true;
+      Region *extractRegion = extractOp->getBlock()->getParent();
+      for (mlir::Operation *user : cur.getUsers()) {
+        auto userBlockIdOpt = CVPipeline::getOpBlockId(user);
+        bool usedInCube = false;
+        if (userBlockIdOpt) {
+          auto it = blockInfoMap.find(*userBlockIdOpt);
+          if (it != blockInfoMap.end() && it->second.isCube) {
+            usedInCube = true;
+          }
+        }
+        if (!usedInCube) {
+          if (auto forOp = dyn_cast<scf::ForOp>(user)) {
+            usedInCube = forOpHasCubeOps(forOp, blockInfoMap);
+          } else if (auto ifOp = dyn_cast<scf::IfOp>(user)) {
+            usedInCube = ifOpHasCubeOps(ifOp, blockInfoMap);
+          }
+        }
+        // A use inside a for/if body (different region) counts as a CUBE use
+        // when that for/if contains CUBE ops.  The current value is a loop
+        // bound / condition operand crossing the boundary; we must NOT follow
+        // the chain into the loop body.
+        if (!usedInCube) {
+          Operation *ancestor = user;
+          while (ancestor) {
+            if (auto forOp = dyn_cast<scf::ForOp>(ancestor)) {
+              usedInCube = forOpHasCubeOps(forOp, blockInfoMap);
+              break;
+            }
+            if (auto ifOp = dyn_cast<scf::IfOp>(ancestor)) {
+              usedInCube = ifOpHasCubeOps(ifOp, blockInfoMap);
+              break;
+            }
+            ancestor = ancestor->getParentOp();
+          }
+        }
+        if (usedInCube) {
+          if (!transferValue) {
+            transferValue = cur;
+          }
+          if (userBlockIdOpt) {
+            handledConsumers.insert(*userBlockIdOpt);
+          }
+          continue;
+        }
+        // Continue along the pure scalar chain, staying within the extract's
+        // region (do not descend into a for/if body).
+        if (user->getNumRegions() == 0 && user->getNumResults() == 1 &&
+            user->getResult(0).getType().isIntOrIndexOrFloat() &&
+            user->getBlock()->getParent() == extractRegion) {
+          worklist.push_back(user->getResult(0));
         }
       }
     }
-    if (hasCubConsumer) {
-      LOG_DEBUG("Found scalar V->C dependency from tensor.extract: "
-                << scalarResult << "\n");
+
+    if (transferValue) {
+      // Producer is the block defining the transferred value (or the extract
+      // op itself if the extract result is what is transferred), so the
+      // SSBuffer store dominates the value.
+      Operation *producerOp = transferValue.getDefiningOp();
+      auto producerIdOpt = CVPipeline::getOpBlockId(producerOp);
+      int producerId =
+          producerIdOpt ? *producerIdOpt
+                        : extractBlockIdOpt.value_or(*tensorBlockIdOpt);
+      for (int consumerId : handledConsumers) {
+        collectDepInfo(transferValue, DependencyType::VectorToCube,
+                       v2cDependencies, producerId, consumerId, info);
+        v2cDependencies.back().isScaler = true;
+      }
+      LOG_DEBUG("Found scalar V->C dependency from tensor.extract chain: "
+                << transferValue << " (extract result " << scalarResult
+                << ")\n");
       handledScalarValues.insert(scalarResult);
       // Mark any enclosing for-loop as handled: its bounds and any ifOp
       // conditions inside derive from this transferred scalar, so they don't
