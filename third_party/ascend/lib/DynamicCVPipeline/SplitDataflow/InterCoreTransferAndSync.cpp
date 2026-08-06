@@ -862,7 +862,7 @@ void InterCoreTransferAndSyncPass::insertInterCoreSync(
     OpBuilder &builder, Operation *transferOp, Operation *consumerStartOp,
     Operation *consumerEndOp, int flag, Location loc, int transferIndex,
     FlagIdReuseManager &flagIdReuseManager, Operation *consumedDataOp,
-    bool isStoreDirectly) {
+    bool isStoreDirectly, int startFlag) {
   LOG_DEBUG("Inserting inter-core synchronization for transferOp: "
             << *transferOp << "\n");
 
@@ -901,14 +901,18 @@ void InterCoreTransferAndSyncPass::insertInterCoreSync(
     attachTransferTags(setOpForWrite, consumerBlockId, config.dstCoreType,
                        transferIndex);
 
+    // The loop-start/loop-end pair uses a separate flag from the per-iteration
+    // read/write syncs.  Otherwise the VECTOR loop WAIT could self-consume the
+    // loop-start SET that the CUBE side needs, deadlocking both cores.
+    auto startFlagAttr = builder.getIntegerAttr(builder.getI64Type(), startFlag);
     builder.setInsertionPoint(mainLoopOp);
     auto setOpForStart = builder.create<SyncBlockSetOp>(
         loc, config.dstCoreAttr, config.forWriteTPipe, config.forWritePipe,
-        flagId);
+        startFlagAttr);
     builder.setInsertionPointAfter(mainLoopOp);
     auto waitOpForEnd = builder.create<SyncBlockWaitOp>(
         loc, config.srcCoreAttr, config.forWriteTPipe, config.forWritePipe,
-        flagId);
+        startFlagAttr);
 
     int startEndBlockId =
         static_cast<int>(CVPipeline::getOpBlockId(mainLoopOp).value_or(-1));
@@ -1121,8 +1125,14 @@ LogicalResult InterCoreTransferAndSyncPass::handleVectorToCube(
     }
   }
 
+  // Only transfers crossing the main loop get a dedicated loop-start/end flag.
+  int startFlagId = -1;
+  if (findMainLoopforTransfer(transferOp, newConsStart)) {
+    startFlagId = flagManager.acquireId(prodStart);
+  }
   insertInterCoreSync(builder, transferOp, newConsStart, newConsEnd, flagId,
-                      loc, transferIndex, flagIdReuseManager, consumedDataOp);
+                      loc, transferIndex, flagIdReuseManager, consumedDataOp,
+                      false, startFlagId);
 
   transferIndex++;
   LOG_DEBUG("Inserted V->C transfer and sync: block "
@@ -1159,9 +1169,13 @@ LogicalResult InterCoreTransferAndSyncPass::handleCubeToVector(
 
   bool isStoreDirectly =
       isStoreDirectlyInUserChain(consumedDataOp->getResult(0));
+  int startFlagId = -1;
+  if (findMainLoopforTransfer(transferOp, newConsStart)) {
+    startFlagId = flagManager.acquireId(newProdStart);
+  }
   insertInterCoreSync(builder, transferOp, newConsStart, newConsEnd, flagId,
                       loc, transferIndex, flagIdReuseManager, consumedDataOp,
-                      isStoreDirectly);
+                      isStoreDirectly, startFlagId);
 
   transferIndex++;
   LOG_DEBUG("Inserted C->V transfer and sync: block "

@@ -156,7 +156,8 @@ private:
                            mlir::Location loc, int transferIndex,
                            FlagIdReuseManager &flagIdReuseManager,
                            mlir::Operation *consumedDataOp = nullptr,
-                           bool isStoreDirectly = false);
+                           bool isStoreDirectly = false,
+                           int startFlag = -1);
   void insertMemDepSync(mlir::OpBuilder &builder, mlir::Operation *producerOp,
                         mlir::Operation *consumerOp, int flag,
                         mlir::Location loc, bool isCubeToVector,
