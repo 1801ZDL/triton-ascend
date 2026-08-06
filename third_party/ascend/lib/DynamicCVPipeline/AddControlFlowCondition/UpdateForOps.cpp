@@ -32,10 +32,6 @@
 
 static constexpr const char *DEBUG_TYPE = "UpdateForOps";
 static constexpr int kPipeSFlagId = 15;
-// CUBE -> VECTOR PIPE_S flag.  Kept separate from kPipeSFlagId so the VECTOR
-// loop WAIT (on flagC) can never consume the VECTOR loop-start SET (on flagV)
-// that the CUBE side waits for.
-static constexpr int kPipeSFlagIdC = 14;
 static constexpr const char *kSsbufferMainLoop = "ssbuffer.main_loop";
 static constexpr const char *kSsbufferIf = "ssbuffer.if";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
@@ -374,20 +370,11 @@ static LogicalResult insertSetOrWaitForForOp(scf::ForOp forOp, Location loc,
   return success();
 }
 
-// Insert PIPE_S for a main_loop forOp based on forOp type and scope type.
-//
-// To avoid a race where the VECTOR side self-consumes its own loop-start SET
-// (SET and WAIT used the same flag, so the VECTOR loop WAIT could eat the SET
-// intended for the CUBE side), VECTOR and CUBE use two distinct PIPE_S flags:
-//   flagV: VECTOR -> CUBE signal (VECTOR SETs, CUBE WAITs)
-//   flagC: CUBE -> VECTOR signal (CUBE SETs, VECTOR WAITs)
-// The VECTOR loop WAIT only waits on flagC, so it can never consume its own
-// flagV SET that the CUBE side needs.
+// Insert PIPE_S for a main_loop forOp based on forOp type and scope type
 static LogicalResult
 insertPipeSForMainLoopForOp(scf::ForOp forOp, scope::ScopeOp scopeOp,
                             bool isScopeCube, bool isScopeVector,
-                            PipeAttr setPipe, PipeAttr waitPipe, int flagV,
-                            int flagC) {
+                            PipeAttr setPipe, PipeAttr waitPipe, int flagId) {
   Block *forBody = &forOp.getRegion().front();
   Location loc = forOp.getLoc();
   bool isVectorFirst = forOp->hasAttr("ssbuffer.vector_first");
@@ -398,50 +385,46 @@ insertPipeSForMainLoopForOp(scf::ForOp forOp, scope::ScopeOp scopeOp,
 
   if (isVectorFirst) {
     if (isScopeCube) {
-      // vector_first + CUBE: before forop (SET flagV), inside (WAIT flagV /
-      // SET flagC)
+      // vector_first + CUBE: before forop (SET), inside (WAIT/SET)
       if (failed(insertSetOrWaitForForOp(forOp, loc, cubeType, setPipe,
-                                         waitPipe, flagV, true))) {
+                                         waitPipe, flagId, true))) {
         return failure();
       }
       if (failed(insertSyncOpsInsideForOp(forBody, loc, cubeType, setPipe,
-                                          waitPipe, flagV, flagC))) {
+                                          waitPipe, flagId, flagId))) {
         return failure();
       }
     } else if (isScopeVector) {
-      // vector_first + VECTOR: inside (WAIT flagC / SET flagV), after forop
-      // (WAIT flagV)
+      // vector_first + VECTOR: inside (WAIT/SET), after forop (WAIT)
       if (failed(insertSyncOpsInsideForOp(forBody, loc, vectorType, setPipe,
-                                          waitPipe, flagC, flagV))) {
+                                          waitPipe, flagId, flagId))) {
         return failure();
       }
       if (failed(insertSetOrWaitForForOp(forOp, loc, vectorType, setPipe,
-                                         waitPipe, flagV, false))) {
+                                         waitPipe, flagId, false))) {
         return failure();
       }
     }
   } else {
     // cube_first (including default when neither attribute is present)
     if (isScopeCube) {
-      // cube_first + CUBE: inside (WAIT flagV / SET flagC), after forop
-      // (WAIT flagV)
+      // cube_first + CUBE: inside (WAIT/SET), after forop (WAIT)
       if (failed(insertSyncOpsInsideForOp(forBody, loc, cubeType, setPipe,
-                                          waitPipe, flagV, flagC))) {
+                                          waitPipe, flagId, flagId))) {
         return failure();
       }
       if (failed(insertSetOrWaitForForOp(forOp, loc, cubeType, setPipe,
-                                         waitPipe, flagV, false))) {
+                                         waitPipe, flagId, false))) {
         return failure();
       }
     } else if (isScopeVector) {
-      // cube_first + VECTOR: before forop (SET flagV), inside (WAIT flagC /
-      // SET flagV)
+      // cube_first + VECTOR: before forop (SET), inside (WAIT/SET)
       if (failed(insertSetOrWaitForForOp(forOp, loc, vectorType, setPipe,
-                                         waitPipe, flagV, true))) {
+                                         waitPipe, flagId, true))) {
         return failure();
       }
       if (failed(insertSyncOpsInsideForOp(forBody, loc, vectorType, setPipe,
-                                          waitPipe, flagC, flagV))) {
+                                          waitPipe, flagId, flagId))) {
         return failure();
       }
     }
@@ -473,8 +456,7 @@ LogicalResult UpdateForOpsPass::insertInterCorePipeS(ModuleOp module) {
       }
       if (failed(insertPipeSForMainLoopForOp(forOp, scopeOp, isScopeCube,
                                              isScopeVector, setPipeType,
-                                             waitPipeType, kPipeSFlagId,
-                                             kPipeSFlagIdC))) {
+                                             waitPipeType, kPipeSFlagId))) {
         return WalkResult::interrupt();
       }
       return WalkResult::advance();
