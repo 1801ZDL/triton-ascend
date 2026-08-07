@@ -776,6 +776,21 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
       return;
     }
 
+    // Only handle extracts located in a CUBE block.  The VECTOR-side extract
+    // (e.g. block 21) is the original computation; the CUBE-side extract
+    // (e.g. block 15) is the copy whose scalar result the CUBE side actually
+    // consumes.  Transferring the VECTOR-side extract creates a CUBE load with
+    // no users (redundant transfer).
+    auto extractBlockIdOpt = CVPipeline::getOpBlockId(extractOp.getOperation());
+    if (!extractBlockIdOpt) {
+      return;
+    }
+    auto extractBlockIt = blockInfoMap.find(*extractBlockIdOpt);
+    if (extractBlockIt == blockInfoMap.end() ||
+        !extractBlockIt->second.isCube) {
+      return;
+    }
+
     mlir::Value scalarResult = extractOp.getResult();
     if (!isa<mlir::IntegerType, mlir::FloatType>(scalarResult.getType())) {
       return;
@@ -784,8 +799,7 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
     // The scalar must be consumed (directly or through a downstream pure
     // scalar chain, e.g. fptosi/muli/subi producing loop bounds) in at least
     // one CUBE block or in a for/if with CUBE content.
-    auto extractBlockIdOpt = CVPipeline::getOpBlockId(extractOp.getOperation());
-    int producerId = extractBlockIdOpt.value_or(*tensorBlockIdOpt);
+    int producerId = *extractBlockIdOpt;
 
     llvm::DenseSet<int> handledConsumers;
     bool hasCubConsumer = false;

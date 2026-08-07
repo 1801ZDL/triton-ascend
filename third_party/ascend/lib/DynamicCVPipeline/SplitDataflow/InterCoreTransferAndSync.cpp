@@ -808,10 +808,13 @@ InterCoreTransferAndSyncPass::getTransferPipeConfig(Operation *transferOp,
     config.srcCoreType = "VECTOR";
     config.dstCoreType = "CUBE";
   } else if (isa<LLVM::StoreOp>(transferOp)) {
-    config.forReadTPipe = pipeVAttr;
-    config.forReadPipe = pipeFixAttr;
-    config.forWriteTPipe = pipeFixAttr;
-    config.forWritePipe = pipeVAttr;
+    // Scalar transfers use PIPE_S (scalar pipe).  Using PIPE_V/PIPE_FIX for
+    // these syncs shares flag space with vector/fix tensor transfers and can
+    // deadlock the cores; PIPE_S keeps the scalar sync isolated.
+    config.forReadTPipe = pipeSAttr;
+    config.forReadPipe = pipeSAttr;
+    config.forWriteTPipe = pipeSAttr;
+    config.forWritePipe = pipeSAttr;
     config.srcCoreAttr = vecCoreAttr;
     config.dstCoreAttr = cubeCoreAttr;
     config.srcCoreType = "VECTOR";
