@@ -90,27 +90,31 @@ private:
 static constexpr int ADDR_INT_TYPE = 64;
 static constexpr int CONST_INT_TYPE = 32;
 
-inline MemRefType getSsbufMemrefType(Builder &builder) {
-  auto i32Type = builder.getIntegerType(CONST_INT_TYPE);
+inline MemRefType getSsbufMemrefType(Builder &builder, Type elemType) {
   auto addressSpaceAttr =
       builder.getAttr<hivm::AddressSpaceAttr>(hivm::AddressSpace::SSBUF);
-  return MemRefType::get({}, i32Type, nullptr, addressSpaceAttr);
+  return MemRefType::get({}, elemType, nullptr, addressSpaceAttr);
 }
 
 inline std::pair<arith::ConstantOp, hivm::PointerCastOp>
-getSsbufConstAndPointerCast(OpBuilder &builder, Location loc, uint64_t addr) {
+getSsbufConstAndPointerCast(OpBuilder &builder, Location loc, uint64_t addr,
+                            Type elemType) {
   auto i64Type = builder.getIntegerType(ADDR_INT_TYPE);
   auto addrAttr = builder.getIntegerAttr(i64Type, addr);
   auto addrConst = builder.create<arith::ConstantOp>(loc, i64Type, addrAttr);
 
   return {addrConst,
-          builder.create<hivm::PointerCastOp>(loc, getSsbufMemrefType(builder),
+          builder.create<hivm::PointerCastOp>(loc,
+                                              getSsbufMemrefType(builder,
+                                                                 elemType),
                                               addrConst.getResult())};
 }
 
 inline hivm::PointerCastOp createPointerCastOp(OpBuilder &builder, Location loc,
                                                uint64_t addr) {
-  return getSsbufConstAndPointerCast(builder, loc, addr).second;
+  // Default to i32 for callers that only store i32 values into SSBuffer.
+  auto i32Type = builder.getIntegerType(CONST_INT_TYPE);
+  return getSsbufConstAndPointerCast(builder, loc, addr, i32Type).second;
 }
 
 } // namespace triton

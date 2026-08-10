@@ -95,7 +95,7 @@ UpdateConditionInfoPass::allocSSBuffer(ModuleOp module) {
   OpBuilder builder(module.getContext());
   auto i64Type = builder.getIntegerType(ADDR_INT_TYPE);
   auto i32Type = builder.getIntegerType(CONST_INT_TYPE);
-  auto memrefType = getSsbufMemrefType(builder);
+  auto memrefType = getSsbufMemrefType(builder, i32Type);
 
   // alloc 2 group of ssbuffer pointers:
   // Core Vector 0: allocate ssbuffer address: 0, 4, 8, ...
@@ -489,7 +489,8 @@ UpdateConditionInfoPass::computeVectorSSBufferMemrefs(
     auto ssbAddr =
         builder.create<arith::AddIOp>(loc, ssbBaseAddr, ssbAddrOffset);
     Value memref = builder.create<PointerCastOp>(
-        loc, getSsbufMemrefType(builder), ssbAddr.getResult());
+        loc, getSsbufMemrefType(builder, builder.getIntegerType(CONST_INT_TYPE)),
+        ssbAddr.getResult());
     vectorSSBufferMemrefs[groupIdx] = memref;
   }
 

@@ -547,7 +547,15 @@ Operation *InterCoreTransferAndSyncPass::insertVectorToCubeTransfer(
   int cubeBlockId = CVPipeline::getOpBlockId(cubeStartOp).value_or(-1);
 
   if (isScalarDependency(dep.value)) {
-    builder.setInsertionPointAfter(vectorEndOp);
+    // Insert the store right after srcValue's defining op (when it has one)
+    // so that the store dominates the load and the scalar consumers.  Falling
+    // back to vectorEndOp keeps behavior for block-argument / external values.
+    mlir::Operation *srcDefOp = srcValue.getDefiningOp();
+    if (srcDefOp) {
+      builder.setInsertionPointAfter(srcDefOp);
+    } else {
+      builder.setInsertionPointAfter(vectorEndOp);
+    }
     SmallVector<Operation *> writeOps;
     LOG_DEBUG("before writeToSSBuffer\n");
     auto addrOpt = ssbufferManager.writeToSSBuffer(srcValue, builder, writeOps);
@@ -568,7 +576,16 @@ Operation *InterCoreTransferAndSyncPass::insertVectorToCubeTransfer(
     attachCrossCoreDeps(sendOp, transferIndex, CVPipeline::crossCoreProducerId,
                         builder);
     LOG_DEBUG("before readFromSSBuffer\n");
-    builder.setInsertionPoint(cubeStartOp);
+    // Place the load after the store when both are in the same MLIR block,
+    // otherwise the load would read an uninitialized SSBuffer slot (store and
+    // load can share a block when producer block == consumer block).
+    if (sendOp && cubeStartOp &&
+        sendOp->getBlock() == cubeStartOp->getBlock() &&
+        !sendOp->isBeforeInBlock(cubeStartOp)) {
+      builder.setInsertionPointAfter(sendOp);
+    } else {
+      builder.setInsertionPoint(cubeStartOp);
+    }
     SmallVector<Operation *> readOps;
     auto loadedValueOpt =
         ssbufferManager.readFromSSBuffer(addr, builder, readOps);
@@ -655,6 +672,12 @@ Operation *InterCoreTransferAndSyncPass::insertVectorToCubeTransfer(
   }
   for (Operation *user : users) {
     LOG_DEBUG("[v->c user]" << *user << "\n");
+    // Do not rewrite the store/send op itself: it must keep referencing the
+    // original srcValue, otherwise the value stored into SSBuffer would be the
+    // just-loaded receiveValue (a store→load self loop).
+    if (user == sendOp) {
+      continue;
+    }
     auto userBlockIdOpt = CVPipeline::getOpBlockId(user);
     if (userBlockIdOpt && *userBlockIdOpt == dep.iniConsumerBlockId) {
       user->replaceUsesOfWith(srcValue, receiveValue);
@@ -789,10 +812,13 @@ InterCoreTransferAndSyncPass::getTransferPipeConfig(Operation *transferOp,
     config.srcCoreType = "VECTOR";
     config.dstCoreType = "CUBE";
   } else if (isa<memref::StoreOp>(transferOp)) {
-    config.forReadTPipe = pipeVAttr;
-    config.forReadPipe = pipeFixAttr;
-    config.forWriteTPipe = pipeFixAttr;
-    config.forWritePipe = pipeVAttr;
+    // Scalar transfers use PIPE_S (scalar pipe).  Using PIPE_V/PIPE_FIX for
+    // these syncs shares flag space with vector/fix tensor transfers and can
+    // deadlock the cores; PIPE_S keeps the scalar sync isolated.
+    config.forReadTPipe = pipeSAttr;
+    config.forReadPipe = pipeSAttr;
+    config.forWriteTPipe = pipeSAttr;
+    config.forWritePipe = pipeSAttr;
     config.srcCoreAttr = vecCoreAttr;
     config.dstCoreAttr = cubeCoreAttr;
     config.srcCoreType = "VECTOR";

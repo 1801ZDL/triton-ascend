@@ -703,6 +703,20 @@ void OpClassifierPass::getUpstreamOpsWithMemoryDeps(
   }
 }
 
+// An arith/math op with a tensor result is VECTOR-only and must not be marked
+// CUBE; scalar arith/math (index/i32 computation) may still be marked CUBE.
+static bool isTensorArithOrMathOp(Operation *op) {
+  if (!isa<arith::ArithDialect, math::MathDialect>(op->getDialect())) {
+    return false;
+  }
+  for (Value result : op->getResults()) {
+    if (isa<RankedTensorType>(result.getType())) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Propagate CUBE core type upstream
 int OpClassifierPass::propagateCubeUpstream() {
   LLVM_DEBUG(DBGS() << "--- Step 2: CUBE upstream BFS --->\n");
@@ -729,21 +743,12 @@ int OpClassifierPass::propagateCubeUpstream() {
       if (!def || cubeVisited.count(def) || isa<linalg::MatmulOp>(def))
         continue;
 
-      // Skip arith dialect ops with tensor results (they should be VECTOR, not
-      // CUBE)
-      if (isa<arith::ArithDialect>(def->getDialect())) {
-        bool hasTensorResult = false;
-        for (Value result : def->getResults()) {
-          if (isa<RankedTensorType>(result.getType())) {
-            hasTensorResult = true;
-            break;
-          }
-        }
-        if (hasTensorResult) {
-          LLVM_DEBUG(DBGS() << "skip " << def->getName().getStringRef()
-                            << ": arith tensor op\n");
-          continue;
-        }
+      // Skip arith/math ops with tensor results (they are VECTOR-only, not
+      // CUBE); scalar arith/math may still be marked CUBE.
+      if (isTensorArithOrMathOp(def)) {
+        LLVM_DEBUG(DBGS() << "skip " << def->getName().getStringRef()
+                          << ": arith/math tensor op\n");
+        continue;
       }
 
       // Skip operations inside linalg block (internal values)
@@ -926,6 +931,11 @@ void OpClassifierPass::propagateCubeUpstreamForOp(Operation *startOp) {
       if (!upstreamOp || cubeVisited.count(upstreamOp))
         continue;
       if (isa<linalg::MatmulOp>(upstreamOp))
+        continue;
+      // Align with the main propagateCubeUpstream: only skip arith/math ops
+      // with tensor results (they are VECTOR-only); scalar arith/math ops
+      // (index/i32 computation) may still be marked CUBE.
+      if (isTensorArithOrMathOp(upstreamOp))
         continue;
 
       cubeVisited.insert(upstreamOp);
