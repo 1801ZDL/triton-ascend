@@ -164,7 +164,12 @@ bool DataDependencyAnalysisPass::isValid1DValueForDependency(
     mlir::Value value) {
   auto tensorTy = dyn_cast<TensorType>(value.getType());
   if (tensorTy && tensorTy.getRank() == SHAPE_1D_LENGTH) {
-    return true;
+    // 只有被 linalg.broadcast 消费的 1-D tensor 才视为有效跨核依赖。
+    // 被 tensor.extract 消费的 1-D tensor 会先被标量化，由标量 SSBuffer
+    // 依赖通道传递，不需要单独的 1-D tensor CopyOp。
+    return llvm::all_of(
+        value.getUsers(),
+        [](mlir::Operation *u) { return isa<linalg::BroadcastOp>(u); });
   }
   return false;
 }
@@ -837,6 +842,208 @@ void DataDependencyAnalysisPass::analyzeExternalOutputs(
   LOG_DEBUG("External output analysis complete.\n");
 }
 
+// Trace defining op chain to check if any upstream op is vector-only.
+// Values in `stopValues` are treated as already-handled scalar dependencies;
+// the trace stops when it hits one, avoiding redundant detection of downstream
+// scalars whose upstream values have already been transferred via SSBuffer.
+static bool hasVectorOpInDefChain(
+    mlir::Value val, llvm::DenseSet<mlir::Operation *> &visited,
+    const llvm::DenseSet<mlir::Value> *stopValues = nullptr) {
+  if (stopValues && stopValues->contains(val)) {
+    return false;
+  }
+  mlir::Operation *defOp = val.getDefiningOp();
+  if (!defOp || visited.contains(defOp)) {
+    return false;
+  }
+  visited.insert(defOp);
+  if (CVPipeline::isVectorOnlyOp(defOp)) {
+    return true;
+  }
+  for (mlir::Value operand : defOp->getOperands()) {
+    if (hasVectorOpInDefChain(operand, visited, stopValues)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Check if a scf.for body contains CUBE operations.
+static bool forOpHasCubeOps(scf::ForOp forOp,
+                            llvm::DenseMap<int, BlockInfo> &blockInfoMap) {
+  bool hasCube = false;
+  forOp.walk([&](mlir::Operation *op) {
+    auto blockIdOpt = CVPipeline::getOpBlockId(op);
+    if (!blockIdOpt) {
+      return mlir::WalkResult::advance();
+    }
+    auto it = blockInfoMap.find(*blockIdOpt);
+    if (it != blockInfoMap.end() && it->second.isCube) {
+      hasCube = true;
+      return mlir::WalkResult::interrupt();
+    }
+    return mlir::WalkResult::advance();
+  });
+  return hasCube;
+}
+
+// Check if any region of an scf.if contains CUBE operations.
+static bool ifOpHasCubeOps(scf::IfOp ifOp,
+                           llvm::DenseMap<int, BlockInfo> &blockInfoMap) {
+  bool hasCube = false;
+  ifOp.walk([&](mlir::Operation *op) {
+    auto blockIdOpt = CVPipeline::getOpBlockId(op);
+    if (!blockIdOpt) {
+      return mlir::WalkResult::advance();
+    }
+    auto it = blockInfoMap.find(*blockIdOpt);
+    if (it != blockInfoMap.end() && it->second.isCube) {
+      hasCube = true;
+      return mlir::WalkResult::interrupt();
+    }
+    return mlir::WalkResult::advance();
+  });
+  return hasCube;
+}
+
+// Detect scalar values extracted from VECTOR-produced tensors in a CUBE block
+// and consumed by CUBE compute.  The extract result is the scalar dependency
+// boundary: transferring it via SSBuffer avoids 1-D tensor CopyOps and lets the
+// CUBE side compute the loop bounds from the loaded scalar.
+//
+// Only extracts located in a CUBE block are considered: the VECTOR-side extract
+// is the original computation, and transferring it creates a CUBE load with no
+// users.  One dependency is created per extract (all consumers share the
+// transfer), avoiding duplicate SSBuffer stores.
+void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
+    DataDependencyInfo &info) {
+  auto &blockInfoMap = info.getBlockInfoMap();
+  auto &v2cDependencies = info.getV2CDependencies();
+
+  // For-loops whose bounds have been handled — ifOp conditions inside these
+  // loops will be computable on CUBE via the induction variable after the
+  // bounds are transferred, so they don't need separate scalar deps.
+  llvm::DenseSet<scf::ForOp> handledForOps;
+
+  LOG_DEBUG("Analyzing scalar V->C dependencies from tensor.extract ops...\n");
+
+  module.walk([&](tensor::ExtractOp extractOp) {
+    mlir::Value sourceTensor = extractOp.getTensor();
+    mlir::Operation *tensorDefOp = sourceTensor.getDefiningOp();
+    if (!tensorDefOp) {
+      return;
+    }
+
+    // tensorDefOp must be a VECTOR-only op on tensor (e.g. math.floor/ceil),
+    // regardless of its block_id label (it may be labelled CUBE by the block
+    // planner even though it can only run on the VECTOR core).
+    if (!CVPipeline::isVectorOnlyOp(tensorDefOp)) {
+      return;
+    }
+
+    // Only handle extracts labelled CUBE (checked via the op's own core_type,
+    // not blockInfoMap.isCube, since a block may mix VECTOR and CUBE ops and
+    // the block-level flag follows the first op).  The VECTOR-side extract is
+    // the original computation; transferring it creates a CUBE load with no
+    // users.  The CUBE-side extract is the copy whose scalar result the CUBE
+    // side actually consumes.
+    if (!getSsbufferCoreType(extractOp.getOperation())
+             .contains(ssbufferCoreTypeCubeAttr)) {
+      return;
+    }
+
+    mlir::Value scalarResult = extractOp.getResult();
+    if (!isa<mlir::IntegerType, mlir::FloatType>(scalarResult.getType())) {
+      return;
+    }
+
+    int producerId = CVPipeline::getOpBlockId(extractOp.getOperation())
+                          .value_or(-1);
+    llvm::DenseSet<int> handledConsumers;
+    bool hasCubConsumer = false;
+
+    // Walk the downstream pure scalar compute chain (fptosi/muli/subi/addi)
+    // within the extract's region; a use inside a for/if body (different
+    // region) counts as a CUBE use when that for/if contains CUBE ops.
+    Region *extractRegion = extractOp->getBlock()->getParent();
+    llvm::SmallVector<mlir::Value> worklist;
+    llvm::DenseSet<mlir::Value> visited;
+    worklist.push_back(scalarResult);
+    while (!worklist.empty()) {
+      mlir::Value cur = worklist.pop_back_val();
+      if (!visited.insert(cur).second) {
+        continue;
+      }
+      for (mlir::Operation *user : cur.getUsers()) {
+        auto userBlockIdOpt = CVPipeline::getOpBlockId(user);
+        // Use the op's own core_type rather than blockInfoMap.isCube (a block
+        // can mix VECTOR and CUBE ops).
+        bool usedInCube =
+            getSsbufferCoreType(user).contains(ssbufferCoreTypeCubeAttr);
+        if (!usedInCube) {
+          if (auto forOp = dyn_cast<scf::ForOp>(user)) {
+            usedInCube = forOpHasCubeOps(forOp, blockInfoMap);
+          } else if (auto ifOp = dyn_cast<scf::IfOp>(user)) {
+            usedInCube = ifOpHasCubeOps(ifOp, blockInfoMap);
+          }
+        }
+        // A use inside a for/if body (different region) counts as a CUBE use
+        // when that for/if contains CUBE ops.
+        if (!usedInCube) {
+          Operation *ancestor = user;
+          while (ancestor) {
+            if (auto forOp = dyn_cast<scf::ForOp>(ancestor)) {
+              usedInCube = forOpHasCubeOps(forOp, blockInfoMap);
+              break;
+            }
+            if (auto ifOp = dyn_cast<scf::IfOp>(ancestor)) {
+              usedInCube = ifOpHasCubeOps(ifOp, blockInfoMap);
+              break;
+            }
+            ancestor = ancestor->getParentOp();
+          }
+        }
+        if (usedInCube) {
+          hasCubConsumer = true;
+          if (userBlockIdOpt) {
+            handledConsumers.insert(*userBlockIdOpt);
+          }
+          continue;
+        }
+        // Continue along the pure scalar chain, staying within the extract's
+        // region (do not descend into a for/if body).
+        if (user->getNumRegions() == 0 && user->getNumResults() == 1 &&
+            user->getResult(0).getType().isIntOrIndexOrFloat() &&
+            user->getBlock()->getParent() == extractRegion) {
+          worklist.push_back(user->getResult(0));
+        }
+      }
+    }
+
+    if (hasCubConsumer && !handledConsumers.empty()) {
+      // Create a single dependency (one SSBuffer store shared by all
+      // consumers), avoiding duplicate stores/syncs.
+      int consumerId = *handledConsumers.begin();
+      collectDepInfo(scalarResult, DependencyType::VectorToCube,
+                     v2cDependencies, producerId, consumerId, info);
+      LOG_DEBUG("Found scalar V->C dependency from tensor.extract: "
+                << scalarResult << "\n");
+      // Mark any enclosing for-loop as handled: ifOp conditions inside derive
+      // from this transferred scalar, so they don't need separate transfers.
+      mlir::Operation *parent = extractOp->getParentOp();
+      while (parent) {
+        if (auto parentForOp = dyn_cast<scf::ForOp>(parent)) {
+          handledForOps.insert(parentForOp);
+          break;
+        }
+        parent = parent->getParentOp();
+      }
+    }
+  });
+
+  LOG_DEBUG("Scalar V->C dependency analysis complete.\n");
+}
+
 void DataDependencyAnalysisPass::collectMemDepInfo(
     llvm::StringRef predCoreType, int producerBlockId, int consumerBlockId,
     int predBlockId, int currBlockId,
@@ -1076,6 +1283,8 @@ void DataDependencyAnalysisPass::runOnOperation() {
   analyzeExternalInputs(info);
 
   analyzeExternalOutputs(info);
+
+  analyzeScalarVToCDependencies(info);
 
   // Step 4: Analyze memory dependencies (memdep sync)
   analyzeMemoryEffect(info);
