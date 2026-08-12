@@ -949,18 +949,12 @@ void DataDependencyAnalysisPass::analyzeScalarExtractDependencies(
       return;
     }
 
-    // Only handle extracts located in a CUBE block.  The VECTOR-side extract
-    // (e.g. block 21) is the original computation; the CUBE-side extract
-    // (e.g. block 15) is the copy whose scalar result the CUBE side actually
-    // consumes.  Transferring the VECTOR-side extract creates a CUBE load with
-    // no users (redundant transfer).
+    // The extract itself is now classified VECTOR by OpClassifier (its source
+    // tensor traces to a VECTOR-only producer), so it is no longer restricted
+    // to CUBE blocks.  Whether the CUBE side actually needs the scalar is
+    // decided by the downstream CUBE-consumer walk below.
     auto extractBlockIdOpt = CVPipeline::getOpBlockId(extractOp.getOperation());
     if (!extractBlockIdOpt) {
-      return;
-    }
-    auto extractBlockIt = blockInfoMap.find(*extractBlockIdOpt);
-    if (extractBlockIt == blockInfoMap.end() ||
-        !extractBlockIt->second.isCube) {
       return;
     }
 
@@ -1020,10 +1014,18 @@ void DataDependencyAnalysisPass::analyzeScalarExtractDependencies(
       }
     }
     if (hasCubConsumer) {
-      // Create a single dependency for this extract result.  All consumers
-      // share one SSBuffer store; one dep avoids duplicate stores (and the
-      // duplicate sync that can deadlock the cores).
-      if (!handledConsumers.empty()) {
+      // analyzeExternalInputs runs before this walk and may already have
+      // recorded a V->C dependency for this extract (it crosses into a CUBE
+      // block as an external input).  Skip the duplicate: a second dep would
+      // produce a second SSBuffer store/sync for the same value and can
+      // deadlock the cores.
+      bool alreadyDep = llvm::any_of(v2cDependencies, [&](const DependencyInfo &d) {
+        return d.value == scalarResult;
+      });
+      if (!alreadyDep && !handledConsumers.empty()) {
+        // Create a single dependency for this extract result.  All consumers
+        // share one SSBuffer store; one dep avoids duplicate stores (and the
+        // duplicate sync that can deadlock the cores).
         int consumerId = *handledConsumers.begin();
         collectDepInfo(scalarResult, DependencyType::VectorToCube,
                        v2cDependencies, producerId, consumerId, info);
