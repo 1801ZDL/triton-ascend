@@ -717,6 +717,30 @@ static bool isTensorArithOrMathOp(Operation *op) {
   return false;
 }
 
+// True if `value`'s defining chain reaches a VECTOR-only op.  A tensor.extract
+// whose source tensor is produced by such an op (e.g. math.floor/ceil) is
+// itself a VECTOR computation: the CUBE side consumes its scalar via the
+// SSBuffer dependency channel and must not recompute the extract, so it should
+// not be marked CUBE.
+static bool hasVectorOnlyProducer(Value value) {
+  llvm::SmallVector<Value> worklist{value};
+  llvm::DenseSet<Operation *> visited;
+  while (!worklist.empty()) {
+    Value cur = worklist.pop_back_val();
+    Operation *defOp = cur.getDefiningOp();
+    if (!defOp || !visited.insert(defOp).second) {
+      continue;
+    }
+    if (CVPipeline::isVectorOnlyOp(defOp)) {
+      return true;
+    }
+    for (Value operand : defOp->getOperands()) {
+      worklist.push_back(operand);
+    }
+  }
+  return false;
+}
+
 // Propagate CUBE core type upstream
 int OpClassifierPass::propagateCubeUpstream() {
   LLVM_DEBUG(DBGS() << "--- Step 2: CUBE upstream BFS --->\n");
@@ -749,6 +773,18 @@ int OpClassifierPass::propagateCubeUpstream() {
         LLVM_DEBUG(DBGS() << "skip " << def->getName().getStringRef()
                           << ": arith/math tensor op\n");
         continue;
+      }
+
+      // An extract of a VECTOR-only-produced tensor is itself a VECTOR
+      // computation; the CUBE side consumes its scalar via SSBuffer and must
+      // not be marked CUBE.
+      if (auto extOp = dyn_cast<tensor::ExtractOp>(def)) {
+        if (hasVectorOnlyProducer(extOp.getTensor())) {
+          cubeVisited.insert(def);
+          LLVM_DEBUG(DBGS() << "skip " << def->getName().getStringRef()
+                            << ": extract of vector-only producer\n");
+          continue;
+        }
       }
 
       // Skip operations inside linalg block (internal values)
@@ -937,6 +973,13 @@ void OpClassifierPass::propagateCubeUpstreamForOp(Operation *startOp) {
       // (index/i32 computation) may still be marked CUBE.
       if (isTensorArithOrMathOp(upstreamOp))
         continue;
+
+      // Extract of a VECTOR-only-produced tensor is a VECTOR computation; the
+      // CUBE side consumes its scalar via SSBuffer, not by recomputing it.
+      if (auto extOp = dyn_cast<tensor::ExtractOp>(upstreamOp)) {
+        if (hasVectorOnlyProducer(extOp.getTensor()))
+          continue;
+      }
 
       cubeVisited.insert(upstreamOp);
       LLVM_DEBUG(DBGS() << "\t\tcube upstream: "

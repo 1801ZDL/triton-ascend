@@ -145,6 +145,10 @@ private:
   void analyzeExternalInputs(DataDependencyInfo &info);
   void analyzeExternalOutputs(DataDependencyInfo &info);
   void analyzeScalarVToCDependencies(DataDependencyInfo &info);
+  void analyzeScalarExtractDependencies(
+      DataDependencyInfo &info,
+      llvm::DenseSet<mlir::Value> &handledScalarValues,
+      llvm::DenseSet<scf::ForOp> &handledForOps);
 
   void analyzeMemoryEffect(DataDependencyInfo &info);
   std::pair<int, int> findCommonLevelBlockIds(DataDependencyInfo &info,

@@ -918,35 +918,16 @@ static bool ifOpHasCubeOps(
   return hasCube;
 }
 
-// Analyze scalar V->C dependencies from control flow ops.
-// Detects when scf.for loop bounds or scf.if conditions are scalar values whose
-// defining chain traces back to vector-only ops (e.g. math.floor/math.ceil on
-// tensors, linalg.reduce). These scalars must be transferred from VECTOR to CUBE.
-//
-// To avoid redundant transfers, scalars already recorded as dependencies are
-// tracked in a stop-set: downstream scalars whose defining chain only reaches
-// vector-only ops through an already-handled scalar are NOT re-recorded.
-void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
-    DataDependencyInfo &info) {
+// Detect scalars extracted from VECTOR-produced tensors and consumed by CUBE
+// blocks.  The extract result is the natural scalar dependency boundary:
+// transferring it via SSBuffer avoids the need for 1-D tensor CopyOps.
+void DataDependencyAnalysisPass::analyzeScalarExtractDependencies(
+    DataDependencyInfo &info,
+    llvm::DenseSet<mlir::Value> &handledScalarValues,
+    llvm::DenseSet<scf::ForOp> &handledForOps) {
   auto &blockInfoMap = info.getBlockInfoMap();
   auto &v2cDependencies = info.getV2CDependencies();
 
-  // Scalars already recorded as V->C deps — downstream values depending on
-  // these don't need separate transfer since the upstream value will be
-  // available on the CUBE side after SSBuffer transfer.
-  llvm::DenseSet<mlir::Value> handledScalarValues;
-
-  // For-loops whose bounds have been handled — ifOp conditions inside these
-  // loops will be computable on CUBE via the induction variable after the
-  // bounds are transferred, so they don't need separate scalar deps.
-  llvm::DenseSet<scf::ForOp> handledForOps;
-
-  LOG_DEBUG("Analyzing scalar V->C dependencies from control flow ops...\n");
-
-  // ---- tensor.extract ops ----
-  // Detect scalars extracted from VECTOR-produced tensors and consumed by CUBE
-  // blocks.  The extract result is the natural scalar dependency boundary:
-  // transferring it via SSBuffer avoids the need for 1-D tensor CopyOps.
   module.walk([&](tensor::ExtractOp extractOp) {
     mlir::Value sourceTensor = extractOp.getTensor();
     mlir::Operation *tensorDefOp = sourceTensor.getDefiningOp();
@@ -1063,6 +1044,38 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
       }
     }
   });
+}
+
+// Analyze scalar V->C dependencies from control flow ops.
+// Detects when scf.for loop bounds or scf.if conditions are scalar values whose
+// defining chain traces back to vector-only ops (e.g. math.floor/math.ceil on
+// tensors, linalg.reduce). These scalars must be transferred from VECTOR to CUBE.
+//
+// To avoid redundant transfers, scalars already recorded as dependencies are
+// tracked in a stop-set: downstream scalars whose defining chain only reaches
+// vector-only ops through an already-handled scalar are NOT re-recorded.
+void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
+    DataDependencyInfo &info) {
+  auto &blockInfoMap = info.getBlockInfoMap();
+  auto &v2cDependencies = info.getV2CDependencies();
+
+  // Scalars already recorded as V->C deps — downstream values depending on
+  // these don't need separate transfer since the upstream value will be
+  // available on the CUBE side after SSBuffer transfer.
+  llvm::DenseSet<mlir::Value> handledScalarValues;
+
+  // For-loops whose bounds have been handled — ifOp conditions inside these
+  // loops will be computable on CUBE via the induction variable after the
+  // bounds are transferred, so they don't need separate scalar deps.
+  llvm::DenseSet<scf::ForOp> handledForOps;
+
+  LOG_DEBUG("Analyzing scalar V->C dependencies from control flow ops...\n");
+
+  // ---- tensor.extract ops ----
+  // Detect scalars extracted from VECTOR-produced tensors and consumed by CUBE
+  // blocks.  The extract result is the natural scalar dependency boundary:
+  // transferring it via SSBuffer avoids the need for 1-D tensor CopyOps.
+  analyzeScalarExtractDependencies(info, handledScalarValues, handledForOps);
 
   // ---- scf.for loop bounds ----
   module.walk([&](scf::ForOp forOp) {
