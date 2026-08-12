@@ -103,9 +103,7 @@ SSBufferManager::writeToSSBuffer(Value value, OpBuilder &builder,
 
   int64_t addrValue = addrResult.value();
   Location loc = builder.getUnknownLoc();
-  // The memref element type must match the stored value's type: with LLVM
-  // pointer ops the element type was untyped, but memref.store verifies that
-  // the value type matches the memref element type.
+  // memref.store requires value type == memref element type.
   auto [constOp, pointerCastOp] =
       getSsbufConstAndPointerCast(builder, loc, addrValue, value.getType());
   createdOps.push_back(constOp);

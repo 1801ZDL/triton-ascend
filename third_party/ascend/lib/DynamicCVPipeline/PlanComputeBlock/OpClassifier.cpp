@@ -703,8 +703,7 @@ void OpClassifierPass::getUpstreamOpsWithMemoryDeps(
   }
 }
 
-// An arith/math op with a tensor result is VECTOR-only and must not be marked
-// CUBE; scalar arith/math (index/i32 computation) may still be marked CUBE.
+// arith/math op with a tensor result is VECTOR-only (not CUBE).
 static bool isTensorArithOrMathOp(Operation *op) {
   if (!isa<arith::ArithDialect, math::MathDialect>(op->getDialect())) {
     return false;
@@ -717,11 +716,9 @@ static bool isTensorArithOrMathOp(Operation *op) {
   return false;
 }
 
-// True if `value`'s defining chain reaches a VECTOR-only op.  A tensor.extract
-// whose source tensor is produced by such an op (e.g. math.floor/ceil) is
-// itself a VECTOR computation: the CUBE side consumes its scalar via the
-// SSBuffer dependency channel and must not recompute the extract, so it should
-// not be marked CUBE.
+// True if `value`'s defining chain reaches a VECTOR-only op.  An extract of
+// such a tensor is itself VECTOR (CUBE gets the scalar via SSBuffer), so it
+// must not be marked CUBE.
 static bool hasVectorOnlyProducer(Value value) {
   llvm::SmallVector<Value> worklist{value};
   llvm::DenseSet<Operation *> visited;
@@ -775,9 +772,7 @@ int OpClassifierPass::propagateCubeUpstream() {
         continue;
       }
 
-      // An extract of a VECTOR-only-produced tensor is itself a VECTOR
-      // computation; the CUBE side consumes its scalar via SSBuffer and must
-      // not be marked CUBE.
+      // An extract of a VECTOR-only tensor is itself VECTOR.
       if (auto extOp = dyn_cast<tensor::ExtractOp>(def)) {
         if (hasVectorOnlyProducer(extOp.getTensor())) {
           cubeVisited.insert(def);
@@ -968,14 +963,12 @@ void OpClassifierPass::propagateCubeUpstreamForOp(Operation *startOp) {
         continue;
       if (isa<linalg::MatmulOp>(upstreamOp))
         continue;
-      // Align with the main propagateCubeUpstream: only skip arith/math ops
-      // with tensor results (they are VECTOR-only); scalar arith/math ops
-      // (index/i32 computation) may still be marked CUBE.
+      // Align with propagateCubeUpstream: skip arith/math with tensor results
+      // (scalar arith/math may still be marked CUBE).
       if (isTensorArithOrMathOp(upstreamOp))
         continue;
 
-      // Extract of a VECTOR-only-produced tensor is a VECTOR computation; the
-      // CUBE side consumes its scalar via SSBuffer, not by recomputing it.
+      // Extract of a VECTOR-only tensor is itself VECTOR.
       if (auto extOp = dyn_cast<tensor::ExtractOp>(upstreamOp)) {
         if (hasVectorOnlyProducer(extOp.getTensor()))
           continue;

@@ -547,9 +547,7 @@ Operation *InterCoreTransferAndSyncPass::insertVectorToCubeTransfer(
   int cubeBlockId = CVPipeline::getOpBlockId(cubeStartOp).value_or(-1);
 
   if (isScalarDependency(dep.value)) {
-    // Insert the store right after srcValue's defining op (when it has one)
-    // so that the store dominates the load and the scalar consumers.  Falling
-    // back to vectorEndOp keeps behavior for block-argument / external values.
+    // Place the store right after the extract so it dominates the load.
     mlir::Operation *srcDefOp = srcValue.getDefiningOp();
     if (srcDefOp) {
       builder.setInsertionPointAfter(srcDefOp);
@@ -576,9 +574,8 @@ Operation *InterCoreTransferAndSyncPass::insertVectorToCubeTransfer(
     attachCrossCoreDeps(sendOp, transferIndex, CVPipeline::crossCoreProducerId,
                         builder);
     LOG_DEBUG("before readFromSSBuffer\n");
-    // Place the load after the store when both are in the same MLIR block,
-    // otherwise the load would read an uninitialized SSBuffer slot (store and
-    // load can share a block when producer block == consumer block).
+    // When store and load share a block (producer == consumer block), load
+    // after the store to avoid reading an uninitialized slot.
     if (sendOp && cubeStartOp &&
         sendOp->getBlock() == cubeStartOp->getBlock() &&
         !sendOp->isBeforeInBlock(cubeStartOp)) {
@@ -672,9 +669,8 @@ Operation *InterCoreTransferAndSyncPass::insertVectorToCubeTransfer(
   }
   for (Operation *user : users) {
     LOG_DEBUG("[v->c user]" << *user << "\n");
-    // Do not rewrite the store/send op itself: it must keep referencing the
-    // original srcValue, otherwise the value stored into SSBuffer would be the
-    // just-loaded receiveValue (a store→load self loop).
+    // Keep the store referencing srcValue, else it stores the loaded value
+    // back (store→load self loop).
     if (user == sendOp) {
       continue;
     }
@@ -812,9 +808,7 @@ InterCoreTransferAndSyncPass::getTransferPipeConfig(Operation *transferOp,
     config.srcCoreType = "VECTOR";
     config.dstCoreType = "CUBE";
   } else if (isa<memref::StoreOp>(transferOp)) {
-    // Scalar transfers use PIPE_S (scalar pipe).  Using PIPE_V/PIPE_FIX for
-    // these syncs shares flag space with vector/fix tensor transfers and can
-    // deadlock the cores; PIPE_S keeps the scalar sync isolated.
+    // Scalar sync uses PIPE_S to stay isolated from tensor flag space.
     config.forReadTPipe = pipeSAttr;
     config.forReadPipe = pipeSAttr;
     config.forWriteTPipe = pipeSAttr;

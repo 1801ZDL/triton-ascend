@@ -1014,12 +1014,8 @@ void mlir::triton::SeparateCVScopePass::runOnOperation() {
                      UnitAttr::get(scopeOp->getContext()));
   });
 
-  // Eliminate redundant store→load pairs in VECTOR scopes.
-  // InterCoreTransferAndSync inserts llvm.store (send to SSBuffer) followed by
-  // llvm.load (receive on the consumer side).  After scope separation the
-  // VECTOR scope contains both: the store sends the value, and the load re-reads
-  // it for use as a for-loop bound.  The load is redundant — the stored value
-  // is already live — so replace loaded values with the stored value.
+  // In VECTOR scopes the SSBuffer store is followed by a redundant load (re-read
+  // for a for-loop bound): replace the load with the stored value and erase it.
   module.walk([](scope::ScopeOp scopeOp) {
     auto coreTypeAttr =
         scopeOp->getAttrOfType<hivm::TCoreTypeAttr>(hivm::TCoreTypeAttr::name);
