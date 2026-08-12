@@ -1210,9 +1210,14 @@ static LogicalResult separateScopes(func::FuncOp funcOp) {
   // Rewrite leftover VECTOR-boundary references in the CUBE scope to their
   // CUBE-side equivalents, then drop the now-dead chains so VECTOR-only ops do
   // not leak into the CUBE scope.
-  replaceVectorRefsInCubeScope(cubeScope, vecScope);
-  retainNeededOpsInScope(cubeScope, "CUBE");
-  retainNeededOpsInScope(vecScope, "VECTOR");
+  //
+  // TEMP: disabled pending end-to-end verification.  With OpClassifier now
+  // marking scalar-dependency extracts (and their math chains) as VECTOR, the
+  // CUBE scope no longer contains these chains, so this rewrite/cleanup is
+  // expected to be dead code.  To be removed if the E2E test passes.
+  // replaceVectorRefsInCubeScope(cubeScope, vecScope);
+  // retainNeededOpsInScope(cubeScope, "CUBE");
+  // retainNeededOpsInScope(vecScope, "VECTOR");
 
   cleanupSsbufferAttrs(funcOp);
 
