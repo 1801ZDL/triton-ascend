@@ -29,26 +29,19 @@
 #include "llvm/Support/Debug.h"
 
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "ascend/include/DynamicCVPipeline/SplitDataflow/SeparateCVScope.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/Scope/IR/Scope.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/RegionUtils.h"
-
-#include "ascend/include/DynamicCVPipeline/Common/Utils.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/SeparateCVScope.h"
-
-#include "bishengir/Dialect/HIVM/IR/HIVM.h"
-#include "bishengir/Dialect/Scope/IR/Scope.h"
 
 using namespace mlir;
 
@@ -956,233 +949,6 @@ static void cleanupSsbufferAttrs(Operation *rootOp) {
   rootOp->walk([](Operation *op) { removeSsbufferAttrs(op); });
 }
 
-// Record, for every value produced along the forward use-chain rooted at
-// `root`, the sequence of op names that led to it.  This lets us pair up a
-// value on the VECTOR side (from a SSBuffer store) with the structurally
-// identical value on the CUBE side (from the matching SSBuffer load).
-static void collectChainPaths(
-    Value root, llvm::DenseMap<Value, std::string> &paths) {
-  llvm::SmallVector<Value> worklist;
-  worklist.push_back(root);
-  paths[root] = "";
-  while (!worklist.empty()) {
-    Value cur = worklist.pop_back_val();
-    std::string curPath = paths[cur];
-    Region *rootRegion = root.getParentRegion();
-    for (Operation *user : cur.getUsers()) {
-      if (user->getNumResults() == 0) {
-        continue;
-      }
-      // Only follow single-result pure-compute ops; stop at anything with
-      // regions or side effects.
-      if (user->getNumRegions() > 0 ||
-          !mlir::wouldOpBeTriviallyDead(user)) {
-        continue;
-      }
-      // Do not cross into nested regions (e.g. a scf.for body): a use inside a
-      // loop is not a candidate for the boundary-mapping used here, and
-      // substituting a value defined there would break dominance.
-      if (user->getBlock()->getParent() != rootRegion) {
-        continue;
-      }
-      Value res = user->getResult(0);
-      if (paths.contains(res)) {
-        continue;
-      }
-      paths[res] = curPath + user->getName().getStringRef().str() + ";";
-      worklist.push_back(res);
-    }
-  }
-}
-
-// Rewrite uses in the CUBE scope that reference values computed on the VECTOR
-// side (boundary scalars derived from math.floor/math.ceil via tensor.extract).
-//
-// Such references are left-over copies of the VECTOR boundary chain that
-// SeparateCVScope cloned into the CUBE scope's mixed for-loop.  The CUBE scope
-// already has an equivalent chain rooted at the SSBuffer load for the same
-// transfer_id (e.g. load %79 -> fptosi -> muli -> %89 vs VECTOR
-// store %extracted_12 -> fptosi -> muli -> %35).  Rewriting the reference makes
-// the VECTOR chain dead so retainNeededOpsInScope can drop it (and the
-// math.floor/math.ceil feeding it), which is required for
-// AnalyzeCubeControlFlowInputChain not to reject the module.
-static void replaceVectorRefsInCubeScope(scope::ScopeOp cubeScope,
-                                         scope::ScopeOp vecScope) {
-  // Map (block_id, op_name) of a VECTOR-side math op to its transfer_id by
-  // walking the store value back to the tensor.extract tensor operand.
-  std::map<std::pair<int, std::string>, int64_t> vecMathToTid;
-  vecScope.walk([&](memref::StoreOp storeOp) {
-    auto tidAttr =
-        storeOp->getAttrOfType<mlir::IntegerAttr>(CVPipeline::kTransferId);
-    if (!tidAttr) {
-      return;
-    }
-    Value storeVal = storeOp.getValue();
-    if (auto ext = dyn_cast<tensor::ExtractOp>(storeVal.getDefiningOp())) {
-      Operation *tensorDef = ext.getTensor().getDefiningOp();
-      if (tensorDef) {
-        auto blockIdOpt = CVPipeline::getOpBlockId(tensorDef);
-        if (blockIdOpt) {
-          vecMathToTid[{*blockIdOpt,
-                        tensorDef->getName().getStringRef().str()}] =
-              tidAttr.getInt();
-        }
-      }
-    }
-  });
-
-  // CUBE-side chains rooted at SSBuffer loads: (transfer, path) -> value.
-  std::map<int64_t, std::map<std::string, Value>> cubePathsByTid;
-  cubeScope.walk([&](memref::LoadOp loadOp) {
-    auto tidAttr =
-        loadOp->getAttrOfType<mlir::IntegerAttr>(CVPipeline::kTransferId);
-    if (!tidAttr) {
-      return;
-    }
-    llvm::DenseMap<Value, std::string> paths;
-    collectChainPaths(loadOp.getResult(), paths);
-    for (auto &pk : paths) {
-      cubePathsByTid[tidAttr.getInt()][pk.second] = pk.first;
-    }
-  });
-
-  // Boundary scalars in the CUBE scope derived from VECTOR math ops: value ->
-  // (transfer, path).  The path is measured from the extracted scalar, so it
-  // aligns with the load-rooted chain path (both skip tensor.extract).
-  llvm::DenseMap<Value, std::pair<int64_t, std::string>> cubeVecBoundary;
-  cubeScope.walk([&](Operation *op) {
-    if (!isa<math::MathDialect>(op->getDialect())) {
-      return;
-    }
-    auto blockIdOpt = CVPipeline::getOpBlockId(op);
-    if (!blockIdOpt) {
-      return;
-    }
-    std::string opName = op->getName().getStringRef().str();
-    auto mIt = vecMathToTid.find({*blockIdOpt, opName});
-    if (mIt == vecMathToTid.end()) {
-      return;
-    }
-    for (Value result : op->getResults()) {
-      for (Operation *user : result.getUsers()) {
-        auto ext = dyn_cast<tensor::ExtractOp>(user);
-        if (!ext) {
-          continue;
-        }
-        llvm::DenseMap<Value, std::string> paths;
-        collectChainPaths(ext.getResult(), paths);
-        for (auto &pk : paths) {
-          cubeVecBoundary[pk.first] = {mIt->second, pk.second};
-        }
-      }
-    }
-  });
-
-  llvm::SmallVector<std::pair<mlir::OpOperand *, mlir::Value>> rewrites;
-  cubeScope.walk([&](Operation *op) {
-    for (mlir::OpOperand &operand : op->getOpOperands()) {
-      Value v = operand.get();
-      auto bIt = cubeVecBoundary.find(v);
-      if (bIt == cubeVecBoundary.end()) {
-        continue;
-      }
-      int64_t tid = bIt->second.first;
-      const std::string &path = bIt->second.second;
-      auto tIt = cubePathsByTid.find(tid);
-      if (tIt == cubePathsByTid.end()) {
-        continue;
-      }
-      auto pIt = tIt->second.find(path);
-      if (pIt == tIt->second.end()) {
-        continue;
-      }
-      mlir::Value replacement = pIt->second;
-      if (replacement.getType() != v.getType()) {
-        continue;
-      }
-      rewrites.push_back({&operand, replacement});
-    }
-  });
-  for (auto &rw : rewrites) {
-    rw.first->set(rw.second);
-  }
-}
-
-// Keep only the ops a scope actually needs, erasing the rest if trivially dead.
-//
-// After InterCoreTransferAndSync replaces tensor.extract results with SSBuffer
-// loads, the extract op and its upstream VECTOR-only chain (math.floor/ceil,
-// boundary computation) may be left behind in the CUBE scope.  Each op in that
-// chain references the next one, so a plain use_empty() check never triggers
-// and the VECTOR-only ops keep leaking into the CUBE scope (later rejected by
-// AnalyzeCubeControlFlowInputChain).
-//
-// Seeds the retained set with ops whose core_type matches the scope, then
-// transitively retains every op feeding a retained op.  Everything else that is
-// trivially dead gets erased.
-static void retainNeededOpsInScope(scope::ScopeOp scopeOp, StringRef scopeType) {
-  llvm::SmallVector<Operation *> ops;
-  scopeOp.walk([&](Operation *op) {
-    if (op->getNumRegions() == 0) {
-      ops.push_back(op);
-    }
-  });
-
-  llvm::DenseSet<Operation *> retained;
-  for (Operation *op : ops) {
-    if (matchesScope(op, scopeType)) {
-      retained.insert(op);
-    }
-  }
-
-  bool changed = true;
-  while (changed) {
-    changed = false;
-    for (Operation *op : ops) {
-      if (retained.contains(op)) {
-        continue;
-      }
-      for (Value result : op->getResults()) {
-        for (Operation *user : result.getUsers()) {
-          if (retained.contains(user)) {
-            retained.insert(op);
-            changed = true;
-            break;
-          }
-        }
-        if (retained.contains(op)) {
-          break;
-        }
-      }
-    }
-  }
-
-  // Iteratively erase use-free ops.  This includes ops that matched the scope
-  // (retained as seeds): a tensor.extract that used to feed a cross-core scalar
-  // may have had all its uses rewritten to the SSBuffer load and is now dead;
-  // keeping it would keep the VECTOR-only math op it consumes alive in this
-  // scope.  Ops with side effects (memref/llvm ops, etc.) are left alone by
-  // wouldOpBeTriviallyDead.
-  bool erased = true;
-  while (erased) {
-    erased = false;
-    llvm::SmallVector<Operation *> toErase;
-    scopeOp.walk([&](Operation *op) {
-      if (op->getNumRegions() > 0) {
-        return;
-      }
-      if (op->use_empty() && mlir::wouldOpBeTriviallyDead(op)) {
-        toErase.push_back(op);
-      }
-    });
-    for (Operation *op : toErase) {
-      if (op->getBlock() && op->use_empty()) {
-        op->erase();
-        erased = true;
-      }
-    }
-  }
-}
 
 static LogicalResult separateScopes(func::FuncOp funcOp) {
   debugDumpOperation("before SeparateCVScope on func", funcOp.getOperation());
@@ -1206,18 +972,6 @@ static LogicalResult separateScopes(func::FuncOp funcOp) {
              funcOp.getName(), "'");
     return failure();
   }
-
-  // Rewrite leftover VECTOR-boundary references in the CUBE scope to their
-  // CUBE-side equivalents, then drop the now-dead chains so VECTOR-only ops do
-  // not leak into the CUBE scope.
-  //
-  // TEMP: disabled pending end-to-end verification.  With OpClassifier now
-  // marking scalar-dependency extracts (and their math chains) as VECTOR, the
-  // CUBE scope no longer contains these chains, so this rewrite/cleanup is
-  // expected to be dead code.  To be removed if the E2E test passes.
-  // replaceVectorRefsInCubeScope(cubeScope, vecScope);
-  // retainNeededOpsInScope(cubeScope, "CUBE");
-  // retainNeededOpsInScope(vecScope, "VECTOR");
 
   cleanupSsbufferAttrs(funcOp);
 
