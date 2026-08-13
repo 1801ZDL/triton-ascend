@@ -1039,15 +1039,13 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
 
   LOG_DEBUG("Analyzing scalar V->C dependencies from control flow ops...\n");
 
-  // Detect scalars extracted from VECTOR-produced tensors and consumed by CUBE
-  // blocks.  The extract result is the natural scalar dependency boundary:
-  // transferring it via SSBuffer avoids the need for 1-D tensor CopyOps.
-  analyzeScalarExtractDependencies(info, handledScalarValues);
-
-  // For-loop bounds and if conditions: each scalar is checked independently
-  // against its own defining chain; there is no cross-suppression between a
-  // loop and an if nested inside it.
-  analyzeScalarControlFlowDependencies(info, handledScalarValues);
+  // Minimal-scope experiment: scalar V->C deps come from external-input only.
+  // The extract and for/if detections are disabled to verify whether
+  // analyzeExternalInputs (which runs earlier and finds VECTOR scalars crossing
+  // into CUBE blocks) alone produces correct transfers.  Re-enable if a kernel
+  // is found where external-input misses a needed scalar.
+  // analyzeScalarExtractDependencies(info, handledScalarValues);
+  // analyzeScalarControlFlowDependencies(info, handledScalarValues);
 
   LOG_DEBUG("Scalar V->C dependency analysis complete.\n");
 }
