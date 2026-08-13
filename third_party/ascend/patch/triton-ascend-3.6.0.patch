@@ -1057,10 +1057,10 @@ index cd871cb2e..988d2a7f9 100644
                  if triton.knobs.compilation.front_end_debugging:
                      raise
 diff --git a/python/triton/runtime/jit.py b/python/triton/runtime/jit.py
-index 0f506818f..1e07a267f 100644
+index 0f506818f..b2992457f 100644
 --- a/python/triton/runtime/jit.py
 +++ b/python/triton/runtime/jit.py
-@@ -398,14 +398,15 @@ def create_function_from_signature(sig, kparams, backend):
+@@ -398,14 +398,16 @@ def create_function_from_signature(sig, kparams, backend):
      assert len(sig.parameters) == len(kparams)
      # Create the function argument list and the dict entries for the return statement
      specialization = []
@@ -1076,10 +1076,12 @@ index 0f506818f..1e07a267f 100644
 +            is_const = kp.is_const
 +            specialize = not kp.do_not_specialize
 +            align = not kp.do_not_specialize_on_alignment
-             ret = f"specialize_impl(backend, {name}, {is_const}, {specialize}, {align})"
+-            ret = f"specialize_impl(backend, {name}, {is_const}, {specialize}, {align})"
++            ret = (f"specialize_impl(backend, {name}, {is_const}, {specialize}, "
++                   f"{align} and backend.use_alignment_specialization(options))")
              if kp.annotation_type:
                  if isinstance(kp.annotation_type, str):
-@@ -413,7 +414,13 @@ def create_function_from_signature(sig, kparams, backend):
+@@ -413,7 +415,13 @@ def create_function_from_signature(sig, kparams, backend):
                          # we do not specialize non-constexpr floats and bools:
                          specialize = False
                  if specialize:
