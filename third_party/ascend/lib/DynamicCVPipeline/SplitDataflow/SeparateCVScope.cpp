@@ -1014,8 +1014,54 @@ void mlir::triton::SeparateCVScopePass::runOnOperation() {
                      UnitAttr::get(scopeOp->getContext()));
   });
 
-  // TEMP: mechanism A (VECTOR redundant-load cleanup) removed to test whether
-  // downstream dead-code elimination handles the redundant VECTOR-side load.
+  // In VECTOR scopes the SSBuffer store is followed by a redundant load (re-read
+  // for a for-loop bound): replace the load with the stored value and erase it.
+  module.walk([](scope::ScopeOp scopeOp) {
+    auto coreTypeAttr =
+        scopeOp->getAttrOfType<hivm::TCoreTypeAttr>(hivm::TCoreTypeAttr::name);
+    if (!coreTypeAttr || coreTypeAttr.getTcoretype() != hivm::TCoreType::VECTOR) {
+      return;
+    }
+
+    llvm::DenseMap<int64_t, mlir::Value> storedValues;
+    scopeOp.walk([&](memref::StoreOp storeOp) {
+      auto transferIdAttr =
+          storeOp->getAttrOfType<mlir::IntegerAttr>(CVPipeline::kTransferId);
+      if (!transferIdAttr) {
+        return;
+      }
+      int64_t tid = transferIdAttr.getInt();
+      storedValues[tid] = storeOp.getValue();
+    });
+
+    if (storedValues.empty()) {
+      return;
+    }
+
+    llvm::SmallVector<memref::LoadOp> deadLoads;
+    scopeOp.walk([&](memref::LoadOp loadOp) {
+      auto transferIdAttr =
+          loadOp->getAttrOfType<mlir::IntegerAttr>(CVPipeline::kTransferId);
+      if (!transferIdAttr) {
+        return;
+      }
+      int64_t tid = transferIdAttr.getInt();
+      auto it = storedValues.find(tid);
+      if (it == storedValues.end()) {
+        return;
+      }
+      mlir::Value storeVal = it->second;
+      if (storeVal == loadOp.getResult()) {
+        return;
+      }
+      loadOp.replaceAllUsesWith(storeVal);
+      deadLoads.push_back(loadOp);
+    });
+    for (memref::LoadOp loadOp : deadLoads) {
+      loadOp->erase();
+    }
+  });
+
   debugDumpOperation("after SeparateCVScopePass", module.getOperation());
 }
 
