@@ -144,13 +144,6 @@ private:
                          mlir::Operation *predOp, mlir::Operation *nextOp);
   void analyzeExternalInputs(DataDependencyInfo &info);
   void analyzeExternalOutputs(DataDependencyInfo &info);
-  void analyzeScalarVToCDependencies(DataDependencyInfo &info);
-  void analyzeScalarExtractDependencies(
-      DataDependencyInfo &info,
-      llvm::DenseSet<mlir::Value> &handledScalarValues);
-  void analyzeScalarControlFlowDependencies(
-      DataDependencyInfo &info,
-      llvm::DenseSet<mlir::Value> &handledScalarValues);
 
   void analyzeMemoryEffect(DataDependencyInfo &info);
   std::pair<int, int> findCommonLevelBlockIds(DataDependencyInfo &info,
