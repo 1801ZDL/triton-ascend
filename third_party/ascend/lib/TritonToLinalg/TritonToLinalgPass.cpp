@@ -949,6 +949,10 @@ void TritonToLinalgPass::runOnOperation() {
     existDot = true;
     return WalkResult::interrupt();
   });
+  moduleOp.walk([&](hfusion::Conv1DOp conv1dOp) {
+    existDot = true;
+    return WalkResult::interrupt();
+  });
   existDotFlag = existDot;
 
   // NOTE: existSIMTOp is intentionally computed AFTER
