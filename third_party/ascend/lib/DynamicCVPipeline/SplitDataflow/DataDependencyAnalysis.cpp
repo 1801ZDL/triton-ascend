@@ -921,8 +921,7 @@ static bool ifOpHasCubeOps(
 // Detect scalars extracted from VECTOR-only tensors and consumed by CUBE.
 void DataDependencyAnalysisPass::analyzeScalarExtractDependencies(
     DataDependencyInfo &info,
-    llvm::DenseSet<mlir::Value> &handledScalarValues,
-    llvm::DenseSet<scf::ForOp> &handledForOps) {
+    llvm::DenseSet<mlir::Value> &handledScalarValues) {
   auto &blockInfoMap = info.getBlockInfoMap();
   auto &v2cDependencies = info.getV2CDependencies();
 
@@ -1023,16 +1022,6 @@ void DataDependencyAnalysisPass::analyzeScalarExtractDependencies(
       LOG_DEBUG("Found scalar V->C dependency from tensor.extract: "
                 << scalarResult << "\n");
       handledScalarValues.insert(scalarResult);
-      // Enclosing loop's bounds/conditions derive from this scalar: no further
-      // transfers needed for them.
-      mlir::Operation *parent = extractOp->getParentOp();
-      while (parent) {
-        if (auto parentForOp = dyn_cast<scf::ForOp>(parent)) {
-          handledForOps.insert(parentForOp);
-          break;
-        }
-        parent = parent->getParentOp();
-      }
     }
   });
 }
@@ -1048,17 +1037,31 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
   // Scalars already transferred; downstream derivatives need no new dep.
   llvm::DenseSet<mlir::Value> handledScalarValues;
 
-  // For-loops whose bounds were transferred: inner ifOp conditions are then
-  // computable via the induction variable, so no separate deps are needed.
-  llvm::DenseSet<scf::ForOp> handledForOps;
-
   LOG_DEBUG("Analyzing scalar V->C dependencies from control flow ops...\n");
 
-  // ---- tensor.extract ops ----
   // Detect scalars extracted from VECTOR-produced tensors and consumed by CUBE
   // blocks.  The extract result is the natural scalar dependency boundary:
   // transferring it via SSBuffer avoids the need for 1-D tensor CopyOps.
-  analyzeScalarExtractDependencies(info, handledScalarValues, handledForOps);
+  analyzeScalarExtractDependencies(info, handledScalarValues);
+
+  // For-loop bounds and if conditions: each scalar is checked independently
+  // against its own defining chain; there is no cross-suppression between a
+  // loop and an if nested inside it.
+  analyzeScalarControlFlowDependencies(info, handledScalarValues);
+
+  LOG_DEBUG("Scalar V->C dependency analysis complete.\n");
+}
+
+// Detect scalar V->C deps from scf.for loop bounds and scf.if conditions.
+// For-loops must contain CUBE ops; bounds/conditions must be scalars whose
+// defining chain reaches a vector-only op.  For/if are checked independently:
+// a handled loop bound does not suppress an if condition inside it, and vice
+// versa.
+void DataDependencyAnalysisPass::analyzeScalarControlFlowDependencies(
+    DataDependencyInfo &info,
+    llvm::DenseSet<mlir::Value> &handledScalarValues) {
+  auto &blockInfoMap = info.getBlockInfoMap();
+  auto &v2cDependencies = info.getV2CDependencies();
 
   // ---- scf.for loop bounds ----
   module.walk([&](scf::ForOp forOp) {
@@ -1086,16 +1089,9 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
       }
 
       llvm::DenseSet<mlir::Operation *> visited;
-      bool hasVectorDep =
-          hasVectorOpInDefChain(bound, visited, &handledScalarValues);
-      if (!hasVectorDep) {
-        // Chain is vector-only but was stopped by an already-handled scalar:
-        // no new dep, but mark the loop handled to suppress inner ifOp deps.
-        llvm::DenseSet<mlir::Operation *> visitedNoStop;
-        if (!hasVectorOpInDefChain(bound, visitedNoStop)) {
-          continue;
-        }
-        handledForOps.insert(forOp);
+      if (!hasVectorOpInDefChain(bound, visited, &handledScalarValues)) {
+        // Bound is not from a vector-only chain, or is already covered by a
+        // transferred scalar (stop-set): no new dep needed.
         continue;
       }
 
@@ -1107,10 +1103,6 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
 
       LOG_DEBUG("Found scalar V->C dependency from forOp bounds: "
                 << bound << "\n");
-
-      // Mark the loop handled: inner ifOp conditions are then computable on
-      // CUBE via the induction variable.
-      handledForOps.insert(forOp);
 
       // Record a single V->C dependency using the for-loop op's own block_id
       // as the consumer.  The bound is also used by ops inside the loop body,
@@ -1138,18 +1130,6 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
       return;
     }
 
-    // Skip if nested in a handled loop: its condition is then computable on
-    // CUBE via the induction variable.
-    mlir::Operation *parent = ifOp->getParentOp();
-    while (parent) {
-      if (auto parentForOp = dyn_cast<scf::ForOp>(parent)) {
-        if (handledForOps.contains(parentForOp)) {
-          return;
-        }
-      }
-      parent = parent->getParentOp();
-    }
-
     mlir::Value condition = ifOp.getCondition();
     if (!isa<mlir::IntegerType>(condition.getType())) {
       return;
@@ -1162,6 +1142,8 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
 
     llvm::DenseSet<mlir::Operation *> visited;
     if (!hasVectorOpInDefChain(condition, visited, &handledScalarValues)) {
+      // Condition is not from a vector-only chain, or is already covered by a
+      // transferred scalar (stop-set): no new dep needed.
       return;
     }
 
@@ -1188,8 +1170,6 @@ void DataDependencyAnalysisPass::analyzeScalarVToCDependencies(
                    producerId, consumerId, info);
     handledScalarValues.insert(condition);
   });
-
-  LOG_DEBUG("Scalar V->C dependency analysis complete.\n");
 }
 
 void DataDependencyAnalysisPass::analyzeMemoryEffect(DataDependencyInfo &info) {

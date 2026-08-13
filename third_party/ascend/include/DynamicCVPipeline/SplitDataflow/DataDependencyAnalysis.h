@@ -147,8 +147,10 @@ private:
   void analyzeScalarVToCDependencies(DataDependencyInfo &info);
   void analyzeScalarExtractDependencies(
       DataDependencyInfo &info,
-      llvm::DenseSet<mlir::Value> &handledScalarValues,
-      llvm::DenseSet<scf::ForOp> &handledForOps);
+      llvm::DenseSet<mlir::Value> &handledScalarValues);
+  void analyzeScalarControlFlowDependencies(
+      DataDependencyInfo &info,
+      llvm::DenseSet<mlir::Value> &handledScalarValues);
 
   void analyzeMemoryEffect(DataDependencyInfo &info);
   std::pair<int, int> findCommonLevelBlockIds(DataDependencyInfo &info,
