@@ -20,39 +20,26 @@
  * THE SOFTWARE.
  */
 
-#ifndef TRITON_ADAPTER_UPDATE_CONDITION_INFO_H
-#define TRITON_ADAPTER_UPDATE_CONDITION_INFO_H
+#ifndef TRITON_ADAPTER_UPDATE_CONDITION_INFO_LEGACY_H
+#define TRITON_ADAPTER_UPDATE_CONDITION_INFO_LEGACY_H
 
-#include <optional>
-
-#include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/SmallPtrSet.h"
-#include "llvm/ADT/SmallVector.h"
-
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/TransformOps/DialectExtension.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Pass/Pass.h"
-
 #include "third_party/ascend/include/DynamicCVPipeline/AddControlFlowCondition.h"
+#include "third_party/ascend/include/DynamicCVPipeline/AddControlFlowCondition/UpdateConditionInfo.h"
+#include <optional>
 
 namespace mlir {
 namespace triton {
-enum class VarUpdateType { INC, DEC };
 
-struct OutputGroupInfo {
-  SmallVector<Operation *> outputs;
-  SmallVector<Value> inputVars;
-};
-
-class UpdateConditionInfoPass
-    : public PassWrapper<UpdateConditionInfoPass, OperationPass<ModuleOp>> {
+class UpdateConditionInfoPassLegacy
+    : public PassWrapper<UpdateConditionInfoPassLegacy,
+                         OperationPass<ModuleOp>> {
 public:
-  UpdateConditionInfoPass() = default;
+  UpdateConditionInfoPassLegacy() = default;
 
   void runOnOperation() override;
 
@@ -193,16 +180,16 @@ private:
   void updateDAGAfterIfOpReplacement(scf::IfOp oldIfOp, scf::IfOp newIfOp);
 
   // Helper function to get pointer based on core type
-  Value getSSBufferMemref(bool isAIC, int groupIdx, int ptrSetIdx,
-                          DenseMap<int, Value> &precomputedPtrs,
-                          ArrayRef<SmallVector<Value>> ssbufferPtrs);
+  Value getSSBufferPtr(bool isAIC, int groupIdx, int ptrSetIdx,
+                       DenseMap<int, Value> &precomputedPtrs,
+                       SmallVector<SmallVector<Value>> ssbufferPtrs);
 
   // Compute pointers for VECTOR core SSBuffer
   std::optional<DenseMap<int, Value>>
-  computeVectorSSBufferMemrefs(OpBuilder &builder, Location loc,
-                               Operation *scopeOp,
-                               SmallVector<int> crossCoreInputValues,
-                               SmallVector<int> crossCoreOutputValues);
+  computeVectorSSBufferPtrs(OpBuilder &builder, Location loc,
+                            Operation *scopeOp,
+                            SmallVector<int> crossCoreInputValues,
+                            SmallVector<int> crossCoreOutputValues);
 
   // Part 2: Add cross-core conditions
   Value addCrossCoreConditions(
@@ -228,16 +215,10 @@ private:
   // Record each ifOp as the variables that need to be controlled when it acts
   // as a consumer or a producer
   llvm::DenseMap<scf::IfOp, TensorIterArgIfOpVars> tensorIterArgIfOpVars;
-
-  template <typename FuncTy>
-  auto createSsbufLoads(OpBuilder &builder, Location loc, bool isAIC,
-                        int groupIdx,
-                        DenseMap<int, Value> &vectorSSBufferMemrefs,
-                        llvm::ArrayRef<SmallVector<Value>> ssbufferMemrefs,
-                        FuncTy &&pred);
 };
 
-std::unique_ptr<OperationPass<ModuleOp>> createUpdateConditionInfoPass();
+std::unique_ptr<OperationPass<ModuleOp>> createUpdateConditionInfoPassLegacy();
+
 } // namespace triton
 } // namespace mlir
-#endif // TRITON_ADAPTER_UPDATE_CONDITION_INFO_H
+#endif // TRITON_ADAPTER_UPDATE_CONDITION_INFO_LEGACY_H
