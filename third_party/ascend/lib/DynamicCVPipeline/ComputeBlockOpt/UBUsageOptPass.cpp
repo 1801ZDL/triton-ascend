@@ -63,13 +63,14 @@ public:
   llvm::StringRef getArgument() const final { return "ub-usage-opt"; }
 
 private:
-  const int64_t MAX_EDGE_SIZE = (1 << 30);
-  int64_t getValueSizeInBytes(Value value);
+  const int MAX_EDGE_SIZE = (1 << 30);
+  const int BLOCK_SMALL_SIZE = 3;
+  int getValueSizeInBytes(Value value);
   void buildUBUsageGraph(Block *block, DenseMap<Operation *, int> &op2nodeId,
                          DenseMap<int, Operation *> &nodeId2op,
                          SmallVector<SmallVector<int>> &linkOut,
                          SmallVector<SmallVector<int>> &linkIn,
-                         SmallVector<int64_t> &linkSize,
+                         SmallVector<int> &linkSize,
                          SmallVector<int> &linkStart, SmallVector<int> &linkEnd,
                          SmallVector<int> &nodeBlockId,
                          SmallVector<int> &nodeCoreType,
@@ -80,20 +81,26 @@ private:
       const SmallVector<SmallVector<int>> &needUbOpts,
       const SmallVector<SmallVector<int>> &linkOut,
       const SmallVector<SmallVector<int>> &linkIn,
-      const SmallVector<int64_t> &linkSize, const SmallVector<int> &linkStart,
+      const SmallVector<int> &linkSize, const SmallVector<int> &linkStart,
       const SmallVector<int> &linkEnd, const SmallVector<int> &nodeBlockId,
       const SmallVector<int> &nodeCoreType,
       DenseMap<int, Operation *> nodeId2op);
-  int64_t sumIncomingLinkSize(int nodeId,
-                              const SmallVector<SmallVector<int>> &linkIn,
-                              const SmallVector<int64_t> &linkSize,
-                              const SmallVector<int> &linkStart,
-                              const SmallVector<int> &linkEnd,
-                              const SmallVector<int> &nodeBlockId);
+  int sumIncomingLinkSize(int nodeId,
+                          const SmallVector<SmallVector<int>> &linkIn,
+                          const SmallVector<int> &linkSize,
+                          const SmallVector<int> &linkStart,
+                          const SmallVector<int> &linkEnd,
+                          const SmallVector<int> &nodeBlockId);
   llvm::LogicalResult
   UBUsageOptimization(Block *block,
                       const CVPipeline::MemoryDependenceGraph &memGraph,
                       CVPipeline::ComputeBlockIdManager &bm);
+  llvm::LogicalResult
+  optBroadcast(Block *block, const CVPipeline::MemoryDependenceGraph &memGraph,
+               CVPipeline::ComputeBlockIdManager &bm);
+  llvm::LogicalResult
+  optSmallBlock(Block *block, const CVPipeline::MemoryDependenceGraph &memGraph,
+                CVPipeline::ComputeBlockIdManager &bm);
 };
 } // namespace triton
 } // namespace mlir
@@ -107,7 +114,7 @@ private:
    not be partitioned here.
     3. Isndex/Other: Set to 0, indicating that it does not occupy any UB.
 */
-int64_t UBUsageOptPass::getValueSizeInBytes(Value value) {
+int UBUsageOptPass::getValueSizeInBytes(Value value) {
   Type type = value.getType();
   auto getElemBytes = [](Type elemType) -> int64_t {
     if (elemType.isIntOrFloat()) {
@@ -128,8 +135,8 @@ int64_t UBUsageOptPass::getValueSizeInBytes(Value value) {
       }
       numElements *= dim;
     }
-    return std::max<int64_t>(
-        1, numElements * getElemBytes(rankedTensorType.getElementType()));
+    return static_cast<int>(std::max<int64_t>(
+        1, numElements * getElemBytes(rankedTensorType.getElementType())));
   }
   // Memref
   if (auto memRefType = dyn_cast<MemRefType>(type)) {
@@ -137,8 +144,9 @@ int64_t UBUsageOptPass::getValueSizeInBytes(Value value) {
   }
   // Vector
   if (auto vectorType = dyn_cast<VectorType>(type)) {
-    return std::max<int64_t>(1, vectorType.getNumElements() *
-                                    getElemBytes(vectorType.getElementType()));
+    return static_cast<int>(
+        std::max<int64_t>(1, vectorType.getNumElements() *
+                                 getElemBytes(vectorType.getElementType())));
   }
   // Index
   if (auto idxTy = dyn_cast<IndexType>(value.getType())) {
@@ -151,7 +159,7 @@ void UBUsageOptPass::buildUBUsageGraph(
     Block *block, DenseMap<Operation *, int> &op2nodeId,
     DenseMap<int, Operation *> &nodeId2op,
     SmallVector<SmallVector<int>> &linkOut,
-    SmallVector<SmallVector<int>> &linkIn, SmallVector<int64_t> &linkSize,
+    SmallVector<SmallVector<int>> &linkIn, SmallVector<int> &linkSize,
     SmallVector<int> &linkStart, SmallVector<int> &linkEnd,
     SmallVector<int> &nodeBlockId, SmallVector<int> &nodeCoreType,
     SmallVector<int> &nodeArgs,
@@ -192,7 +200,7 @@ void UBUsageOptPass::buildUBUsageGraph(
   };
 
   DenseMap<std::pair<int, int>, bool> visited;
-  auto addEdge = [&](int src, int dst, int64_t sizeInBytes) {
+  auto addEdge = [&](int src, int dst, int sizeInBytes) {
     if (visited.contains(std::make_pair(src, dst))) {
       return;
     }
@@ -203,7 +211,7 @@ void UBUsageOptPass::buildUBUsageGraph(
       LOG_DEBUG("op edge from " << *nodeId2op[src] << " to " << *nodeId2op[dst]
                                 << "\n");
     }
-    int edgeId = linkSize.size();
+    int edgeId = static_cast<int>(linkSize.size());
     linkSize.push_back(sizeInBytes);
     linkStart.push_back(src);
     linkEnd.push_back(dst);
@@ -275,7 +283,7 @@ void UBUsageOptPass::buildUBUsageGraph(
         }
 
         int srcNode = getOrCreateNodeId(srcInBlock);
-        int64_t edgeSize = getValueSizeInBytes(operand);
+        int edgeSize = getValueSizeInBytes(operand);
         if (fromArgEdge) {
           edgeSize *= 2;
         }
@@ -318,10 +326,9 @@ void UBUsageOptPass::buildUBUsageGraph(
   }
 }
 
-static SmallVector<int>
-findDependency(int targetNdoe, int preNode,
-               const SmallVector<SmallVector<int>> &linkIn,
-               const SmallVector<int> &linkStart) {
+SmallVector<int> findDependency(int targetNdoe, int preNode,
+                                const SmallVector<SmallVector<int>> &linkIn,
+                                const SmallVector<int> &linkStart) {
   SmallVector<int> dependNodes;
   DenseSet<int> visited;
   std::queue<int> queue;
@@ -345,12 +352,12 @@ findDependency(int targetNdoe, int preNode,
   return dependNodes;
 }
 
-static bool isActiveEndNode(int srcNode, int endNode,
-                            const SmallVector<SmallVector<int>> &linkIn,
-                            const SmallVector<int> &linkStart,
-                            const SmallVector<int> &nodeBlockId,
-                            const SmallVector<int> &nodeCoreType,
-                            DenseMap<int, Operation *> nodeId2op) {
+bool isActiveEndNode(int srcNode, int endNode,
+                     const SmallVector<SmallVector<int>> &linkIn,
+                     const SmallVector<int> &linkStart,
+                     const SmallVector<int> &nodeBlockId,
+                     const SmallVector<int> &nodeCoreType,
+                     DenseMap<int, Operation *> nodeId2op) {
   int nodeNum = static_cast<int>(nodeBlockId.size());
   if (nodeCoreType[endNode] != nodeCoreType[srcNode]) {
     return false;
@@ -372,9 +379,7 @@ static bool isActiveEndNode(int srcNode, int endNode,
   for (int node : dependNodes) {
     if (nodeBlockId[node] != nodeBlockId[endNode] &&
         nodeBlockId[node] != nodeBlockId[srcNode]) {
-      if (linkIn[node].size() != 0) {
-        return false;
-      }
+      return false;
     }
   }
   return true;
@@ -418,11 +423,11 @@ static SmallVector<SmallVector<int>> collectNeedUbOpts(
   return needUbOpts;
 }
 
-int64_t UBUsageOptPass::sumIncomingLinkSize(
+int UBUsageOptPass::sumIncomingLinkSize(
     int nodeId, const SmallVector<SmallVector<int>> &linkIn,
-    const SmallVector<int64_t> &linkSize, const SmallVector<int> &linkStart,
+    const SmallVector<int> &linkSize, const SmallVector<int> &linkStart,
     const SmallVector<int> &linkEnd, const SmallVector<int> &nodeBlockId) {
-  int64_t totalSize = 0;
+  int totalSize = 0;
   for (int edgeId : linkIn[nodeId]) {
     if (nodeBlockId[linkStart[edgeId]] != nodeBlockId[linkEnd[edgeId]]) {
       if (linkSize[edgeId] == MAX_EDGE_SIZE) {
@@ -464,7 +469,7 @@ DenseMap<int, int> UBUsageOptPass::collectRecordChange(
     const SmallVector<SmallVector<int>> &needUbOpts,
     const SmallVector<SmallVector<int>> &linkOut,
     const SmallVector<SmallVector<int>> &linkIn,
-    const SmallVector<int64_t> &linkSize, const SmallVector<int> &linkStart,
+    const SmallVector<int> &linkSize, const SmallVector<int> &linkStart,
     const SmallVector<int> &linkEnd, const SmallVector<int> &nodeBlockId,
     const SmallVector<int> &nodeCoreType,
     DenseMap<int, Operation *> nodeId2op) {
@@ -488,11 +493,11 @@ DenseMap<int, int> UBUsageOptPass::collectRecordChange(
       LOG_DEBUG("activateSet Size:" << activateSet.size() << "\n");
 
       for (int activateNode : activateSet) {
-        int64_t originUBSize = sumIncomingLinkSize(
-            activateNode, linkIn, linkSize, linkStart, linkEnd, nodeBlockId);
+        int originUBSize = sumIncomingLinkSize(activateNode, linkIn, linkSize,
+                                               linkStart, linkEnd, nodeBlockId);
         LOG_DEBUG("activateNode:" << *nodeId2op.at(activateNode) << "\n");
         LOG_DEBUG("originUBSize:" << originUBSize << "\n");
-        int64_t minUBSize = originUBSize;
+        int minUBSize = originUBSize;
         SmallVector<int> chain;
         chain.push_back(activateNode);
         int bestCutPointIdx = -1;
@@ -510,7 +515,7 @@ DenseMap<int, int> UBUsageOptPass::collectRecordChange(
           chain.push_back(uniqueNextNode);
         }
         for (auto i = 0; i < chain.size(); i++) {
-          auto nowUBSize = 0LL;
+          auto nowUBSize = 0;
           LOG_DEBUG("now chain op = " << *nodeId2op.at(chain[i]) << "\n");
           for (auto cutEdgeId : linkOut[chain[i]]) {
             if (linkSize[cutEdgeId] == MAX_EDGE_SIZE) {
@@ -675,11 +680,6 @@ static void processOpsInblock(Operation *parentOp, int targetId,
   if (parentBlockId == -1) {
     return;
   }
-  // LinalgDialect should have targetId only in prarent, the inner op shouldn't
-  // have blockId.
-  if (isa<linalg::LinalgDialect>(parentOp->getDialect())) {
-    return;
-  }
 
   bool allSame = true;
   parentOp->walk([&](Operation *op) {
@@ -747,7 +747,7 @@ llvm::LogicalResult UBUsageOptPass::UBUsageOptimization(
   DenseMap<int, Operation *> nodeId2op;
   SmallVector<SmallVector<int>> linkOut;
   SmallVector<SmallVector<int>> linkIn;
-  SmallVector<int64_t> linkSize;
+  SmallVector<int> linkSize;
   SmallVector<int> linkStart;
   SmallVector<int> linkEnd;
   SmallVector<int> nodeBlockId;
@@ -783,6 +783,133 @@ llvm::LogicalResult UBUsageOptPass::UBUsageOptimization(
   return llvm::success();
 }
 
+llvm::LogicalResult
+UBUsageOptPass::optBroadcast(Block *block,
+                             const CVPipeline::MemoryDependenceGraph &memGraph,
+                             CVPipeline::ComputeBlockIdManager &bm) {
+  if (!isa<scf::ForOp>(block->getParentOp())) {
+    return llvm::success();
+  }
+
+  int errcnt = 0;
+  llvm::SmallVector<Operation *> broadcastOps;
+  for (Operation &op : *block) {
+    if (!isa<linalg::BroadcastOp>(op)) {
+      continue;
+    }
+    auto broadcastOp = dyn_cast<linalg::BroadcastOp>(&op);
+    if (CVPipeline::getOpCoreType(broadcastOp) !=
+        CVPipeline::CoreType::VECTOR_ONLY) {
+      continue;
+    }
+    if (!broadcastOp->hasOneUse()) {
+      continue;
+    }
+
+    llvm::SmallVector<std::pair<Operation *, int>> userBlockIds;
+    Operation *user = *broadcastOp->getUsers().begin();
+    Operation *userInBlock = CVPipeline::getAncestorInBlock(user, block);
+    if (!userInBlock || userInBlock->getBlock() != block) {
+      continue;
+    }
+    if (CVPipeline::getOpCoreType(userInBlock) !=
+        CVPipeline::CoreType::VECTOR_ONLY) {
+      continue;
+    }
+    int userBlockId = bm.getBlockIdByOp(userInBlock);
+    int broadcastBlockId = bm.getBlockIdByOp(broadcastOp);
+    if (userBlockId == broadcastBlockId) {
+      continue;
+    }
+    llvm::SmallVector<Operation *> willaddOps{broadcastOp};
+
+    if (!willCreateCycle(willaddOps, block, memGraph, userBlockId, bm)
+             .value_or(true)) {
+      bm.updateBlockId(broadcastOp, userBlockId);
+    } else {
+      LOG_DEBUG("Moved" << *broadcastOp << " to blockId: " << userBlockId
+                        << " err!!!\n");
+      errcnt++;
+    }
+  }
+  if (errcnt > 0) {
+    LOG_DEBUG("Failed to move " << errcnt << " broadcast ops.\n");
+    return llvm::failure();
+  }
+  return llvm::success();
+}
+
+llvm::LogicalResult
+UBUsageOptPass::optSmallBlock(Block *block,
+                              const CVPipeline::MemoryDependenceGraph &memGraph,
+                              CVPipeline::ComputeBlockIdManager &bm) {
+  if (!isa<scf::ForOp>(block->getParentOp())) {
+    return llvm::success();
+  }
+
+  int errcnt = 0;
+  int maxBlockId = -1;
+  for (Operation &op : *block) {
+    int blockId = bm.getBlockIdByOp(&op);
+    if (blockId > maxBlockId) {
+      maxBlockId = blockId;
+    }
+  }
+
+  for (int blockId = 0; blockId <= maxBlockId; ++blockId) {
+    auto opsInSmallBlcok = bm.getOpsByBlockId(blockId);
+    if (opsInSmallBlcok.size() > BLOCK_SMALL_SIZE || opsInSmallBlcok.empty()) {
+      continue;
+    }
+
+    SetVector<int> candidateUserBlockIds;
+    for (Operation *op : opsInSmallBlcok) {
+      for (auto operand : op->getOperands()) {
+        auto defOp = operand.getDefiningOp();
+        if (!defOp) {
+          continue;
+        }
+        Operation *defInBlock = CVPipeline::getAncestorInBlock(defOp, block);
+        if (!defInBlock || defInBlock->getBlock() != block) {
+          continue;
+        }
+        if (CVPipeline::getOpCoreType(defInBlock) !=
+            CVPipeline::CoreType::VECTOR_ONLY) {
+          continue;
+        }
+
+        int candidateBlockId = bm.getBlockIdByOp(defInBlock);
+        if (candidateBlockId != blockId && candidateBlockId != -1) {
+          candidateUserBlockIds.insert(candidateBlockId);
+        }
+      }
+    }
+
+    if (candidateUserBlockIds.size() != 1) {
+      continue;
+    }
+    llvm::SmallVector<Operation *> willaddOps(opsInSmallBlcok.begin(),
+                                              opsInSmallBlcok.end());
+    if (!willCreateCycle(willaddOps, block, memGraph, candidateUserBlockIds[0],
+                         bm)
+             .value_or(true)) {
+      for (Operation *op : opsInSmallBlcok) {
+        bm.updateBlockId(op, candidateUserBlockIds[0]);
+      }
+    } else {
+      LOG_DEBUG("Failed to merge small block "
+                << blockId << " to block " << candidateUserBlockIds[0] << "\n");
+      errcnt++;
+    }
+  }
+
+  if (errcnt > 0) {
+    LOG_DEBUG("Failed to merge " << errcnt << " small blocks.\n");
+    return llvm::failure();
+  }
+  return llvm::success();
+}
+
 void mlir::triton::UBUsageOptPass::runOnOperation() {
   LOG_DEBUG("--- Pass: UBUsageOpt ---\n");
 
@@ -795,6 +922,11 @@ void mlir::triton::UBUsageOptPass::runOnOperation() {
   auto &aliasAnalysis = getAnalysis<AliasAnalysis>();
   CVPipeline::MemoryDependenceGraph memDepGraph(module, aliasAnalysis);
   auto bm = CVPipeline::ComputeBlockIdManager(module);
+  bool isUBRefineOptEnabled = false;
+  auto attr = module->getAttr(CVPipeline::kEnableUbRefineOpt);
+  if (attr) {
+    isUBRefineOptEnabled = true;
+  }
 
   llvm::SmallVector<Block *> blocks;
   module.walk([&](Block *block) { blocks.push_back(block); });
@@ -802,6 +934,15 @@ void mlir::triton::UBUsageOptPass::runOnOperation() {
   for (Block *block : blocks) {
     if (UBUsageOptimization(block, memDepGraph, bm).failed()) {
       LOG_DEBUG("UB usage optimization failed in block.\n");
+    }
+    if (isUBRefineOptEnabled) {
+      if (optBroadcast(block, memDepGraph, bm).failed()) {
+        LOG_DEBUG("Broadcast check failed in block.\n");
+      }
+
+      if (optSmallBlock(block, memDepGraph, bm).failed()) {
+        LOG_DEBUG("Small block optimization failed in block.\n");
+      }
     }
   }
 

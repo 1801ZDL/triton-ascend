@@ -321,21 +321,63 @@ bool FixpipeOptPass::isValidMul(Operation *op, Value matmulValue,
   return false;
 }
 
+bool FixpipeOptPass::isSubviewFromGlobalMemory(
+    ViewLikeOpInterface viewOp, SetVector<Operation *> &matchedOps) {
+  // Subview ops may be nested many layers deep through reinterpretation or
+  // other subviews. like, subview (subview (reinterpret_cast (subview
+  // (reinterpret_cast (arg0))))) so we need Search and only keep same block
+  // view-like op.
+  Value source = viewOp.getViewSource();
+  auto block = viewOp->getBlock();
+  while (true) {
+    LOG_DEBUG("Check view source: " << source << "\n");
+    if (auto blockArg = dyn_cast<BlockArgument>(source)) {
+      Operation *parentOp = blockArg.getOwner()->getParentOp();
+      if (isa<func::FuncOp>(parentOp)) {
+        return true;
+      } else {
+        LOG_DEBUG(
+            "Subview source block argument is not from func entry block.");
+        return false;
+      }
+    }
+    // From other view-like op
+    if (auto viewLike = dyn_cast<ViewLikeOpInterface>(source.getDefiningOp())) {
+      if (viewLike->getBlock() == block) {
+        matchedOps.insert(viewLike.getOperation());
+      }
+      source = viewLike.getViewSource();
+      continue;
+    }
+    LOG_DEBUG(
+        "Subview source defining op is not ViewLikeOpInterface: " << source);
+    return false;
+  }
+  return false;
+}
+
 bool FixpipeOptPass::isStoreToGM(Operation *storeOp,
                                  SetVector<Operation *> &matchedOps) {
-  Value viewValue = nullptr;
+  ViewLikeOpInterface viewOp = nullptr;
   if (auto materializeOp =
           dyn_cast<bufferization::MaterializeInDestinationOp>(storeOp)) {
-    viewValue = materializeOp.getDest();
+    Value destMemref = materializeOp.getDest();
+    viewOp = destMemref.getDefiningOp<ViewLikeOpInterface>();
   } else if (auto hivmStore = dyn_cast<hivm::StoreOp>(storeOp)) {
-    viewValue = hivmStore.getDst();
+    auto dest = hivmStore.getDst();
+    viewOp = dest.getDefiningOp<ViewLikeOpInterface>();
   } else {
     LOG_DEBUG("Cannot find store op, NOT match");
     return false;
   }
 
+  if (!viewOp) {
+    LOG_DEBUG("store destination is not from ViewLikeOpInterface, NOT match");
+    return false;
+  }
   matchedOps.insert(storeOp);
-  if (!CVPipeline::collectViewOpsAndCheckGlobalMemory(viewValue, matchedOps)) {
+  matchedOps.insert(viewOp);
+  if (!isSubviewFromGlobalMemory(viewOp, matchedOps)) {
     LOG_DEBUG("Subview is not from global memory (GM), NOT match.");
     return false;
   }
@@ -529,16 +571,15 @@ void FixpipeOptPass::getDependentDialects(DialectRegistry &registry) const {
 }
 
 void FixpipeOptPass::runOnOperation() {
-  LOG_DEBUG("== FixpipeOpt Pass Start ==\n");
   ModuleOp module = getOperation();
 
   if (CVPipeline::hasFallbackAttr(module)) {
     return;
   }
 
-  LOG_DEBUG(module);
   auto &aliasAnalysis = getAnalysis<AliasAnalysis>();
   CVPipeline::MemoryDependenceGraph memDepGraph(module, aliasAnalysis);
+  LOG_DEBUG("== FixpipeOpt Pass Start ==\n");
   LOG_DEBUG(module);
 
   SmallVector<SetVector<Operation *>> allMatchedPatterns;
@@ -558,12 +599,12 @@ void FixpipeOptPass::runOnOperation() {
           D
       Now we want to fuse A/B/C, so clone A' for D to avoid cycle.
   */
-  auto bm = CVPipeline::ComputeBlockIdManager(module);
+  auto bmOriginal = CVPipeline::ComputeBlockIdManager(module);
   for (auto &matchedOps : allMatchedPatterns) {
-    CVPipeline::cloneScalarOpsForCrossBlockUses(
-        bm, matchedOps, bm.getBlockIdByOp(matchedOps[0]));
+    CVPipeline::cloneScalarOpsForCrossBlockUses(bmOriginal, matchedOps);
   }
 
+  auto bm = CVPipeline::ComputeBlockIdManager(module);
   for (auto &matchedOps : allMatchedPatterns) {
     if (!applyFixpipeOpt(matchedOps, memDepGraph, bm)) {
       for (Operation *op : matchedOps) {
