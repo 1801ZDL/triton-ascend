@@ -458,7 +458,8 @@ static bool isAllocTensorPattern(Value depVal) {
 }
 
 SmallVector<Value>
-collectBufferValues(DenseMap<Value, SmallVector<Value>> &depValueMap) {
+collectBufferValues(DenseMap<Value, SmallVector<Value>> &depValueMap,
+                    Operation *loopOp) {
   SmallVector<Value> valueList;
   SmallVector<Operation *> seenOps;
 
@@ -491,12 +492,28 @@ collectBufferValues(DenseMap<Value, SmallVector<Value>> &depValueMap) {
     }
   }
 
+  // depValueMap is keyed on Value (pointer-hashed), so iterating it directly
+  // gives a non-deterministic valueList order and therefore a non-deterministic
+  // multi-buffer alloc order (each depVal has a unique defining op). Sort by
+  // the defining op's IR position so the alloc order / UB buffer slot
+  // assignment is stable across runs.
+  if (loopOp) {
+    DenseMap<Operation *, int> opOrder;
+    int order = 0;
+    loopOp->walk([&](Operation *op) { opOrder[op] = order++; });
+    llvm::sort(valueList, [&](Value a, Value b) {
+      return opOrder.lookup(a.getDefiningOp()) <
+             opOrder.lookup(b.getDefiningOp());
+    });
+  }
+
   return valueList;
 }
 
 SmallVector<Value>
 collectScalarDeps(DenseMap<Value, SmallVector<Value>> &depValueMap,
-                  DenseMap<Value, SmallVector<Operation *>> &depUserMap) {
+                  DenseMap<Value, SmallVector<Operation *>> &depUserMap,
+                  Operation *loopOp) {
   SmallVector<Value> scalarValueList;
 
   for (auto &p : depValueMap) {
@@ -540,6 +557,19 @@ collectScalarDeps(DenseMap<Value, SmallVector<Value>> &depValueMap,
       if (hasCrossBlockUser)
         scalarValueList.push_back(depVal);
     }
+  }
+
+  // Same determinism issue as collectBufferValues: depValueMap is keyed on
+  // Value (pointer-hashed). Sort by defining-op IR position so dep_mark
+  // numbering is stable across runs.
+  if (loopOp) {
+    DenseMap<Operation *, int> opOrder;
+    int order = 0;
+    loopOp->walk([&](Operation *op) { opOrder[op] = order++; });
+    llvm::sort(scalarValueList, [&](Value a, Value b) {
+      return opOrder.lookup(a.getDefiningOp()) <
+             opOrder.lookup(b.getDefiningOp());
+    });
   }
 
   return scalarValueList;
@@ -1672,7 +1702,20 @@ static int processTensorDependencies(
     OpBuilder &globalBuilder, int &groupId) {
   SmallVector<Operation *> seenOps;
 
-  for (auto &blockPair : blocks) {
+  // blocks is keyed on Value (pointer-hashed); iterate it in deterministic IR
+  // order of the block's first op so the intraDeps group numbering (and the
+  // per-depVal producer/consumer emission order) is stable across runs.
+  DenseMap<Operation *, int> opOrder;
+  int order = 0;
+  loop.getOperation()->walk([&](Operation *op) { opOrder[op] = order++; });
+  SmallVector<std::pair<Value, InnerBlockInfo>> orderedBlocks(blocks.begin(),
+                                                              blocks.end());
+  llvm::sort(orderedBlocks, [&](const auto &a, const auto &b) {
+    return opOrder.lookup(a.first.getDefiningOp()) <
+           opOrder.lookup(b.first.getDefiningOp());
+  });
+
+  for (auto &blockPair : orderedBlocks) {
     Value blockKey = blockPair.first;
     auto depIt = depValueMap.find(blockKey);
     if (depIt == depValueMap.end())
@@ -2026,7 +2069,7 @@ static int addInnerMultiBuffer(MainLoop mainLoop, OpBuilder &builder,
   if (cloneAllocTensorsInBlocks(mainLoop, blocks, depValueMap, depUserMap,
                                 globalBuilder) != 0)
     return -1;
-  auto valueList = collectBufferValues(depValueMap);
+  auto valueList = collectBufferValues(depValueMap, mainLoop.getOperation());
   LLVM_DEBUG(
       llvm::dbgs()
       << "[addInnerMultiBuffer] before insertBuffersBeforeLoop, valueList.size="
@@ -2037,7 +2080,8 @@ static int addInnerMultiBuffer(MainLoop mainLoop, OpBuilder &builder,
 
   LLVM_DEBUG(
       llvm::dbgs() << "[addInnerMultiBuffer] before collectScalarDeps\n");
-  auto scalarValueList = collectScalarDeps(depValueMap, depUserMap);
+  auto scalarValueList =
+      collectScalarDeps(depValueMap, depUserMap, mainLoop.getOperation());
 
   LLVM_DEBUG(llvm::dbgs() << "[addInnerMultiBuffer] before markScalarDeps\n");
   markScalarDeps(scalarValueList, depUserMap, globalBuilder, 1);
