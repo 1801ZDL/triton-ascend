@@ -116,7 +116,8 @@ void AddControlFlowConditionPass::runOnOperation() {
   // crossCoreDependentMap
 
   constexpr llvm::StringLiteral legacyKernel[] = {
-      "chunk_gated_delta_rule_fwd_kernel_h_blockdim128"};
+      "chunk_gated_delta_rule_fwd_kernel_h_blockdim128",
+      "parallel_path_fwd_kernel", "parallel_path_fwd_kernel_debug"};
   bool useLegacyConditions = false;
   for (auto &op : module.getOps()) {
     auto funcOp = llvm::dyn_cast<func::FuncOp>(&op);
