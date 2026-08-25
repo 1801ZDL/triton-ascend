@@ -72,22 +72,6 @@ using namespace triton;
 using namespace hivm;
 using namespace CVPipeline;
 
-// Deterministic comparator for control variables. All control variables are
-// loop region iter args (BlockArguments); ordering by iter-arg index makes the
-// rebuilt scf.if result/yield slot order independent of the DenseSet<Value>
-// (pointer-hashed) iteration order used to collect them.
-static bool valueIterArgIndexLess(Value a, Value b) {
-  auto ba = dyn_cast<BlockArgument>(a);
-  auto bb = dyn_cast<BlockArgument>(b);
-  if (ba && bb)
-    return ba.getArgNumber() < bb.getArgNumber();
-  if (ba)
-    return true;
-  if (bb)
-    return false;
-  return false; // non-block-args are equivalent (should not occur)
-}
-
 static void logConditionGroupIndices(llvm::StringRef label,
                                      llvm::ArrayRef<int> groupIndices) {
   std::string message;
@@ -330,23 +314,8 @@ void UpdateConditionInfoPass::collectDependencyBuffers(
       auto &loopDeps = info->intraCoreDependentMap[loopOp];
       DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
           intraCoreBuffers;
-      // loopDeps is keyed on Operation*; iterating it directly assigns buffer
-      // group indices in DenseMap bucket order, which depends on pointer
-      // addresses and is non-deterministic across runs. Assign group indices
-      // in the deterministic IR order of the consumer op instead, so the
-      // intra-core control-variable binding is stable.
-      DenseMap<Operation *, int> opOrder;
-      int order = 0;
-      loopOp->walk([&](Operation *op) { opOrder[op] = order++; });
-
-      SmallVector<std::pair<Operation *, SmallVector<Operation *>>>
-          orderedDeps(loopDeps.begin(), loopDeps.end());
-      llvm::sort(orderedDeps, [&](const auto &a, const auto &b) {
-        return opOrder.lookup(a.first) < opOrder.lookup(b.first);
-      });
-
       int intraCoreIdx = 0;
-      for (auto &entry : orderedDeps) {
+      for (auto &entry : loopDeps) {
         intraCoreBuffers[intraCoreIdx][entry.first] = entry.second;
         intraCoreIdx++;
       }
@@ -1029,21 +998,19 @@ int UpdateConditionInfoPass::buildTensorIterArgIfOpVarMap(Operation *loopOp) {
     }
   }
 
-  // Convert the temporary data structure to tensorIfOpVarMap. vars is a
-  // DenseSet<Value> whose iteration order depends on pointer addresses; sort
-  // by iter-arg index so the rebuilt condition/result slot order is stable.
+  // Convert the temporary data structure to tensorIfOpVarMap
   for (auto &[producer, vars] : producerVars) {
     auto &ifOpVars = tensorIterArgIfOpVars[producer];
-    SmallVector<Value> sortedVars(vars.begin(), vars.end());
-    llvm::sort(sortedVars, valueIterArgIndexLess);
-    ifOpVars.producerVars.append(sortedVars.begin(), sortedVars.end());
+    for (Value var : vars) {
+      ifOpVars.producerVars.push_back(var);
+    }
   }
 
   for (auto &[consumer, vars] : consumerVars) {
     auto &ifOpVars = tensorIterArgIfOpVars[consumer];
-    SmallVector<Value> sortedVars(vars.begin(), vars.end());
-    llvm::sort(sortedVars, valueIterArgIndexLess);
-    ifOpVars.consumerVars.append(sortedVars.begin(), sortedVars.end());
+    for (Value var : vars) {
+      ifOpVars.consumerVars.push_back(var);
+    }
   }
   return UPDATE_CONDITION_INFO_SUCCESS;
 }
@@ -1152,11 +1119,6 @@ int UpdateConditionInfoPass::setIntraCoreCondition(
   for (Value var : usedVarsSet) {
     currentUsedVars.push_back(var);
   }
-  // usedVarsSet is a DenseSet<Value> whose iteration order depends on pointer
-  // addresses (non-deterministic across runs). currentUsedVars determines the
-  // order of the extra scf.if result slots / yield operands rebuilt below, so
-  // sort by loop iter-arg index to make the emitted IR deterministic.
-  llvm::sort(currentUsedVars, valueIterArgIndexLess);
   LDBG("Built " << conditions.size() << " intraCore conditions using "
                 << currentUsedVars.size() << " control variables." << "\n");
 
