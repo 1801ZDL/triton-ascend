@@ -277,6 +277,8 @@ UpdateConditionInfoPass::allocSSBuffer(ModuleOp module) {
         ssbufferVec0Memrefs.push_back(memref0.getResult());
         ssbufferVec1Memrefs.push_back(memref1.getResult());
       }
+      builder.create<hivm::PipeBarrierOp>(
+          loc, hivm::PipeAttr::get(builder.getContext(), hivm::PIPE::PIPE_ALL));
       return mlir::WalkResult::interrupt();
     }
     return mlir::WalkResult::advance();
