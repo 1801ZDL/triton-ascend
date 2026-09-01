@@ -1377,7 +1377,8 @@ void AddMultiBufferOuterScopePass::runOnOperation() {
   }
   if (inputOverBudget) {
     LDBG("FALLBACK: FlagBudget, input flag id > "
-         << kReservedPipeFlagId << ", rc=" << CVPipeline::ERRCODE_IGNORED << ".");
+         << kReservedPipeFlagId << ", rc=" << CVPipeline::ERRCODE_IGNORED
+         << ".");
     CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_IGNORED);
     return;
   }
@@ -1393,7 +1394,8 @@ void AddMultiBufferOuterScopePass::runOnOperation() {
     if (maxOutputFlag > FlagIdManager::MAX_FLAG_ID) {
       LDBG("FALLBACK: FlagBudget, estimated flag id "
            << maxOutputFlag << " exceeds usable range (0.."
-           << FlagIdManager::MAX_FLAG_ID << "), fallback to single-buffer mode.");
+           << FlagIdManager::MAX_FLAG_ID
+           << "), fallback to single-buffer mode.");
       isDoubleBuf = false;
     }
   }
