@@ -50,15 +50,11 @@ Operation *findFirstUserInBlock(ArrayRef<Operation *> users, Block *block) {
   return nullptr;
 }
 
-// Sink a single reinterpret_cast: clone it into every block (other than its
-// defining block) where its result is used, redirecting those users to the
-// clone. Returns the number of clones created; erases `reinterpretOp` if it
-// ends up with no remaining uses.
-//
-// No dominance check is needed: every user of `result` is dominated by
-// `reinterpretOp` (SSA dominance), and `reinterpretOp`'s operands dominate
-// `reinterpretOp`, so by transitivity every operand already dominates the
-// insertion point (just before the first user in the target block).
+// Sink one reinterpret_cast into child use blocks:
+// 1. Group users by their parent block.
+// 2. Clone before each target block's first user.
+// 3. Redirect that block's users to the clone.
+// 4. Erase original if no remaining uses.
 int sinkReinterpretCastOp(memref::ReinterpretCastOp reinterpretOp) {
   Value result = reinterpretOp.getResult();
   Block *defBlock = reinterpretOp->getBlock();

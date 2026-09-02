@@ -29,11 +29,7 @@
 
 namespace mlir::triton::CVSplit {
 
-/// Pass that sinks memref.reinterpret_cast ops from their defining block
-/// into each target block where they are used. When an op is defined in one
-/// block but used inside child blocks (e.g. scf.if/scf.for/scf.while), clone
-/// the reinterpret_cast into each child block just before the first use
-/// and erase the original if no uses remain at the defining site.
+/// Sinks memref.reinterpret_cast into the blocks where they are used.
 class ReinterpretCastSinkingPass
     : public PassWrapper<ReinterpretCastSinkingPass, OperationPass<ModuleOp>> {
 public:
