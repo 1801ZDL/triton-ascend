@@ -25,7 +25,6 @@
 
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Block.h"
-#include "mlir/IR/Dominance.h"
 #include "mlir/IR/Value.h"
 
 #include "ascend/include/DynamicCVPipeline/StandardizeOp/ReinterpretCastSinking.h"
@@ -37,115 +36,102 @@ static constexpr const char *DEBUG_TYPE = "ReinterpretCastSinking";
 #define LOG_DEBUG(...)                                                         \
   LLVM_DEBUG(llvm::dbgs() << "\n[" << DEBUG_TYPE << "] " << __VA_ARGS__ << "\n")
 
+namespace {
+
+// Find the earliest user of `result` that lives in `block`, scanning the
+// block in IR order. Used as the clone insertion point for that block.
+Operation *findFirstUserInBlock(ArrayRef<Operation *> users, Block *block) {
+  for (auto &op : *block) {
+    for (auto *user : users) {
+      if (user == &op)
+        return user;
+    }
+  }
+  return nullptr;
+}
+
+// Sink a single reinterpret_cast: clone it into every block (other than its
+// defining block) where its result is used, redirecting those users to the
+// clone. Returns the number of clones created; erases `reinterpretOp` if it
+// ends up with no remaining uses.
+//
+// No dominance check is needed: every user of `result` is dominated by
+// `reinterpretOp` (SSA dominance), and `reinterpretOp`'s operands dominate
+// `reinterpretOp`, so by transitivity every operand already dominates the
+// insertion point (just before the first user in the target block).
+int sinkReinterpretCastOp(memref::ReinterpretCastOp reinterpretOp) {
+  Value result = reinterpretOp.getResult();
+  Block *defBlock = reinterpretOp->getBlock();
+
+  // Group users by their parent block.
+  DenseMap<Block *, SmallVector<Operation *>> blockUsers;
+  for (auto *user : result.getUsers()) {
+    blockUsers[user->getBlock()].push_back(user);
+  }
+
+  // If all uses are in the defining block, nothing to do.
+  if (blockUsers.size() == 1 && blockUsers.count(defBlock)) {
+    return 0;
+  }
+
+  LOG_DEBUG("Processing " << reinterpretOp << " with " << blockUsers.size()
+                          << " target blocks");
+
+  OpBuilder builder(reinterpretOp->getContext());
+  int cloned = 0;
+
+  for (auto &[targetBlock, users] : blockUsers) {
+    if (targetBlock == defBlock) {
+      continue;
+    }
+
+    Operation *firstUser = findFirstUserInBlock(users, targetBlock);
+    if (!firstUser) {
+      LOG_DEBUG("  Could not find first user in target block");
+      continue;
+    }
+
+    // Clone the reinterpret_cast before the first user.
+    builder.setInsertionPoint(firstUser);
+    Value clonedResult =
+        builder.clone(*reinterpretOp.getOperation())->getResult(0);
+    LOG_DEBUG("  Cloned before " << *firstUser << " in block");
+
+    // Redirect all users in this block to the cloned result.
+    for (auto *user : users) {
+      user->replaceUsesOfWith(result, clonedResult);
+    }
+
+    ++cloned;
+  }
+
+  // If no uses remain in the defining block, erase the original.
+  if (cloned > 0 && result.use_empty()) {
+    LOG_DEBUG("  Erasing original: " << reinterpretOp);
+    reinterpretOp->erase();
+  }
+
+  return cloned;
+}
+
+} // namespace
+
 namespace mlir::triton::CVSplit {
 
 void ReinterpretCastSinkingPass::runOnOperation() {
   ModuleOp mod = getOperation();
-  DominanceInfo domInfo;
 
   // Collect all reinterpret_cast ops first, since we'll be modifying the IR.
   SmallVector<memref::ReinterpretCastOp> opsToProcess;
   mod->walk([&](memref::ReinterpretCastOp op) { opsToProcess.push_back(op); });
 
-  int totalProcessed = 0;
   int totalCloned = 0;
-
   for (auto reinterpretOp : opsToProcess) {
-    Value result = reinterpretOp.getResult();
-    Block *defBlock = reinterpretOp->getBlock();
-
-    // Group users by their parent block.
-    DenseMap<Block *, SmallVector<Operation *>> blockUsers;
-    for (auto *user : result.getUsers()) {
-      blockUsers[user->getBlock()].push_back(user);
-    }
-
-    // If all uses are in the defining block, nothing to do.
-    if (blockUsers.size() == 1 && blockUsers.count(defBlock))
-      continue;
-
-    LOG_DEBUG("Processing " << reinterpretOp << " with " << blockUsers.size()
-                            << " target blocks");
-
-    // For each target block different from defBlock, clone the op.
-    OpBuilder builder(reinterpretOp->getContext());
-    bool anyCloned = false;
-
-    for (auto &[targetBlock, users] : blockUsers) {
-      if (targetBlock == defBlock)
-        continue;
-
-      // Find the earliest user in this block as insertion point.
-      Operation *firstUser = nullptr;
-      for (auto &op : *targetBlock) {
-        for (auto *user : users) {
-          if (user == &op) {
-            firstUser = user;
-            break;
-          }
-        }
-        if (firstUser)
-          break;
-      }
-
-      if (!firstUser) {
-        LOG_DEBUG("  Could not find first user in target block");
-        continue;
-      }
-
-      // Check that all operands dominate the insertion point.
-      bool operandsDominate = true;
-      for (Value operand : reinterpretOp->getOperands()) {
-        if (auto *operandOp = operand.getDefiningOp()) {
-          if (!domInfo.dominates(operandOp, firstUser)) {
-            LOG_DEBUG("  Operand " << operand << " does not dominate target");
-            operandsDominate = false;
-            break;
-          }
-        } else {
-          // Block arguments always dominate within their region.
-          auto *operandBlock = operand.getParentBlock();
-          if (!domInfo.dominates(operandBlock, targetBlock)) {
-            LOG_DEBUG("  Block arg " << operand
-                                     << " block does not dominate target");
-            operandsDominate = false;
-            break;
-          }
-        }
-      }
-
-      if (!operandsDominate) {
-        LOG_DEBUG("  Skipping target block due to dominance");
-        continue;
-      }
-
-      // Clone the reinterpret_cast before the first user.
-      builder.setInsertionPoint(firstUser);
-      auto *clonedOp = builder.clone(*reinterpretOp.getOperation());
-      Value clonedResult = clonedOp->getResult(0);
-
-      LOG_DEBUG("  Cloned before " << *firstUser << " in block");
-
-      // Redirect all users in this block to the cloned result.
-      for (auto *user : users) {
-        user->replaceUsesOfWith(result, clonedResult);
-      }
-
-      anyCloned = true;
-      totalCloned++;
-    }
-
-    // If no uses remain in the defining block, erase the original.
-    if (anyCloned && result.use_empty()) {
-      LOG_DEBUG("  Erasing original: " << reinterpretOp);
-      reinterpretOp->erase();
-    }
-
-    totalProcessed++;
+    totalCloned += sinkReinterpretCastOp(reinterpretOp);
   }
 
-  LOG_DEBUG("Processed " << totalProcessed << " ops, cloned " << totalCloned
-                         << " times");
+  LOG_DEBUG("Processed " << opsToProcess.size() << " ops, cloned "
+                         << totalCloned << " times");
 }
 
 std::unique_ptr<OperationPass<ModuleOp>> createReinterpretCastSinkingPass() {
