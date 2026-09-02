@@ -34,76 +34,43 @@ using namespace triton;
 
 static constexpr const char *DEBUG_TYPE = "ReinterpretCastSinking";
 #define LOG_DEBUG(...)                                                         \
-  LLVM_DEBUG(llvm::dbgs() << "\n[" << DEBUG_TYPE << "] " << __VA_ARGS__ << "\n")
+  LLVM_DEBUG(llvm::dbgs() << "[" << DEBUG_TYPE << "] " << __VA_ARGS__ << "\n")
 
 namespace {
 
-// Find the earliest user of `result` that lives in `block`, scanning the
-// block in IR order. Used as the clone insertion point for that block.
-Operation *findFirstUserInBlock(ArrayRef<Operation *> users, Block *block) {
-  for (auto &op : *block) {
-    for (auto *user : users) {
-      if (user == &op)
-        return user;
-    }
-  }
-  return nullptr;
-}
-
-// Sink one reinterpret_cast into child use blocks:
-// 1. Group users by their parent block.
-// 2. Clone before each target block's first user.
-// 3. Redirect that block's users to the clone.
-// 4. Erase original if no remaining uses.
+// Sink one reinterpret_cast: insert a clone immediately before every user.
+// 1. Snapshot all result users.
+// 2. Clone cast before each user.
+// 3. Redirect each user to its clone.
+// 4. Erase original when all uses redirected.
 int sinkReinterpretCastOp(memref::ReinterpretCastOp reinterpretOp) {
   Value result = reinterpretOp.getResult();
-  Block *defBlock = reinterpretOp->getBlock();
 
-  // Group users by their parent block.
-  DenseMap<Block *, SmallVector<Operation *>> blockUsers;
-  for (auto *user : result.getUsers()) {
-    blockUsers[user->getBlock()].push_back(user);
-  }
+  // Snapshot users before mutating uses.
+  SmallVector<Operation *> users;
+  for (Operation *user : result.getUsers())
+    users.push_back(user);
 
-  // If all uses are in the defining block, nothing to do.
-  if (blockUsers.size() == 1 && blockUsers.count(defBlock)) {
-    return 0;
-  }
-
-  LOG_DEBUG("Processing " << reinterpretOp << " with " << blockUsers.size()
-                          << " target blocks");
+  LOG_DEBUG("Processing " << reinterpretOp << " with " << users.size()
+                          << " users");
 
   OpBuilder builder(reinterpretOp->getContext());
   int cloned = 0;
 
-  for (auto &[targetBlock, users] : blockUsers) {
-    if (targetBlock == defBlock) {
-      continue;
-    }
-
-    Operation *firstUser = findFirstUserInBlock(users, targetBlock);
-    if (!firstUser) {
-      LOG_DEBUG("  Could not find first user in target block");
-      continue;
-    }
-
-    // Clone the reinterpret_cast before the first user.
-    builder.setInsertionPoint(firstUser);
+  // Clone before every user: an MLIR block may later be split into
+  // multiple block_ids, so users must not share the cast. Redundant
+  // clones are eliminated by a later CSE pass.
+  for (auto *user : users) {
+    builder.setInsertionPoint(user);
     Value clonedResult =
         builder.clone(*reinterpretOp.getOperation())->getResult(0);
-    LOG_DEBUG("  Cloned before " << *firstUser << " in block");
-
-    // Redirect all users in this block to the cloned result.
-    for (auto *user : users) {
-      user->replaceUsesOfWith(result, clonedResult);
-    }
-
+    user->replaceUsesOfWith(result, clonedResult);
     ++cloned;
   }
 
-  // If no uses remain in the defining block, erase the original.
+  // Erase the original once every use has been redirected.
   if (cloned > 0 && result.use_empty()) {
-    LOG_DEBUG("  Erasing original: " << reinterpretOp);
+    LOG_DEBUG("Erasing original: " << reinterpretOp);
     reinterpretOp->erase();
   }
 
