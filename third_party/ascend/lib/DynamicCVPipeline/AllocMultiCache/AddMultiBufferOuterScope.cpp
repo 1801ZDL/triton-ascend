@@ -1219,7 +1219,8 @@ static Value prepareLoopPolling(Operation *loopOp, Operation *waitOp,
     // (counter % 2) == 0
     Block &after = whileOp.getAfter().front();
     Value counter = after.getArgument(after.getNumArguments() - 1);
-    builderOut.setInsertionPoint(after.getTerminator());
+    // Insert at body start to dominate the wrapping scf.ifs.
+    builderOut.setInsertionPointToStart(&after);
     OpBuilder condBuilder(builderOut);
     Value c2 =
         condBuilder.create<arith::ConstantIntOp>(whileOp.getLoc(), 2, 32);
