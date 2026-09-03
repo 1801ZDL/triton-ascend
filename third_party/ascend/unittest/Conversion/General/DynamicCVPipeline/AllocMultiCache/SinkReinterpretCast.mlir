@@ -1,16 +1,9 @@
 // RUN: triton-opt --ssbuf-sink-reinterpret-cast %s | FileCheck %s
 
-// Test: Sink memref.reinterpret_cast into child blocks
-//
-// Scenario: A memref.reinterpret_cast is defined in the parent block
-// of two scf.if ops. Each scf.if uses the reinterpret_cast result
-// via memref.subview.
-//
-// Expected: The reinterpret_cast is cloned into each scf.if block
-// just before the first use, and the original definition is erased.
-// This is verified by checking that a memref.reinterpret_cast with
-// sizes: [64], strides: [8] appears exactly twice in the output
-// (once in each scf.if), and each appears inside an scf.if block.
+// Test: sink memref.reinterpret_cast before every user.
+// - cast defined in parent block, one user per scf.if (memref.subview)
+// - clone inserted immediately before each user; block may split into block_ids later
+// - original erased once all uses redirected, so cast appears once per scf.if
 
 // CHECK-LABEL: func.func @test_sink_reinterpret_cast
 // CHECK: scf.if

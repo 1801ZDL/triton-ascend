@@ -57,9 +57,8 @@ int sinkReinterpretCastOp(memref::ReinterpretCastOp reinterpretOp) {
   OpBuilder builder(reinterpretOp->getContext());
   int cloned = 0;
 
-  // Clone before every user: an MLIR block may later be split into
-  // multiple block_ids, so users must not share the cast. Redundant
-  // clones are eliminated by a later CSE pass.
+  // Clone per user: block may split into multiple block_ids;
+  // CSE drops redundant clones.
   for (auto *user : users) {
     builder.setInsertionPoint(user);
     Value clonedResult =
