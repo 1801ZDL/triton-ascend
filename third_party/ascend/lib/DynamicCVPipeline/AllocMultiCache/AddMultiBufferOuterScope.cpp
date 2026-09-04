@@ -1251,10 +1251,9 @@ static int addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups) {
     Value senderCond = prepareLoopPolling(senderWaitParent,
                                           g.senderChain.waitOp, senderBuilder);
     if (!senderCond) {
-      LDBG("FALLBACK: unexpected sender loop op " << senderWaitParent->getName()
-                                                  << ", rc="
-                                                  << CVPipeline::ERRCODE_IGNORED
-                                                  << ".");
+      LDBG("FALLBACK: unexpected sender loop op "
+           << senderWaitParent->getName()
+           << ", rc=" << CVPipeline::ERRCODE_IGNORED << ".");
       return CVPipeline::ERRCODE_IGNORED;
     }
 
@@ -1283,8 +1282,8 @@ static int addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups) {
             receiverWaitParent, g.receiverChain.waitOp, receiverBuilder);
         if (!receiverCond) {
           LDBG("FALLBACK: unexpected receiver loop op "
-               << receiverWaitParent->getName() << ", rc="
-               << CVPipeline::ERRCODE_IGNORED << ".");
+               << receiverWaitParent->getName()
+               << ", rc=" << CVPipeline::ERRCODE_IGNORED << ".");
           return CVPipeline::ERRCODE_IGNORED;
         }
         if (processTransferChain(g.receiverChain, receiverCond,
