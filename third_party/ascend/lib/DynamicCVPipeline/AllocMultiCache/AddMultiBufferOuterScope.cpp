@@ -775,6 +775,8 @@ static Value ensureWhileOpHasCounter(scf::WhileOp whileOp) {
   newResultTypes.push_back(i32Type);
 
   Value counterIterArg;
+  Operation *counterOne = nullptr;
+  Operation *counterAdd = nullptr;
 
   // Rebuild via the Builder callback API (matching InnerScope's
   // setupWhileIterArgCounter)
@@ -812,6 +814,8 @@ static Value ensureWhileOpHasCounter(scf::WhileOp whileOp) {
         auto oldYield = cast<scf::YieldOp>(oldAfter->getTerminator());
         Value one = ab.create<arith::ConstantIntOp>(al, 1, 32);
         Value nextCounter = ab.create<arith::AddIOp>(al, counterIterArg, one);
+        counterOne = one.getDefiningOp();
+        counterAdd = nextCounter.getDefiningOp();
         SmallVector<Value> yOps;
         for (Value v : oldYield.getOperands())
           yOps.push_back(map.lookupOrDefault(v));
@@ -823,6 +827,22 @@ static Value ensureWhileOpHasCounter(scf::WhileOp whileOp) {
   for (auto attr : oldWhile->getAttrs())
     newWhile->setAttr(attr.getName(), attr.getValue());
   newWhile->setAttr(CVPipeline::kIterCounter, builder.getUnitAttr());
+
+  // Tag counter-update ops with the last block_id of the after body so
+  // CloneOps' block-id contiguity check holds (mirrors InnerScope's
+  // insertWhileCounterOps).
+  Block &afterBody = newWhile.getAfter().front();
+  std::optional<int> lastBlockId;
+  for (Operation &op : afterBody) {
+    if (auto id = CVPipeline::getOpBlockId(&op))
+      lastBlockId = *id;
+  }
+  if (lastBlockId && counterOne && counterAdd) {
+    IntegerAttr blockIdAttr = builder.getI32IntegerAttr(*lastBlockId);
+    counterOne->setAttr(CVPipeline::kBlockId, blockIdAttr);
+    counterAdd->setAttr(CVPipeline::kBlockId, blockIdAttr);
+    counterAdd->setAttr(CVPipeline::kIterCounter, builder.getUnitAttr());
+  }
 
   // Replace results (exclude counter result)
   for (unsigned i = 0, e = oldWhile.getNumResults(); i < e; ++i)
@@ -1222,15 +1242,31 @@ static Value prepareLoopPolling(Operation *loopOp, Operation *waitOp,
     Value counter = after.getArgument(after.getNumArguments() - 1);
     // Insert at body start to dominate the wrapping scf.ifs.
     builderOut.setInsertionPointToStart(&after);
+    // Tag the condition ops with the first body block_id so the
+    // block-id contiguity check in CloneOps holds.
+    std::optional<int> pollBlockId;
+    for (Operation &op : after) {
+      if (auto id = CVPipeline::getOpBlockId(&op)) {
+        pollBlockId = *id;
+        break;
+      }
+    }
+    if (!pollBlockId)
+      pollBlockId = bid;
     OpBuilder condBuilder(builderOut);
     Value c2 =
         condBuilder.create<arith::ConstantIntOp>(whileOp.getLoc(), 2, 32);
+    setSsbufferTags(c2.getDefiningOp(), condBuilder, *pollBlockId, tid);
     Value rem =
         condBuilder.create<arith::RemSIOp>(whileOp.getLoc(), counter, c2);
+    setSsbufferTags(rem.getDefiningOp(), condBuilder, *pollBlockId, tid);
     Value c0 =
         condBuilder.create<arith::ConstantIntOp>(whileOp.getLoc(), 0, 32);
-    return condBuilder.create<arith::CmpIOp>(whileOp.getLoc(),
-                                             arith::CmpIPredicate::eq, rem, c0);
+    setSsbufferTags(c0.getDefiningOp(), condBuilder, *pollBlockId, tid);
+    Value cond = condBuilder.create<arith::CmpIOp>(
+        whileOp.getLoc(), arith::CmpIPredicate::eq, rem, c0);
+    setSsbufferTags(cond.getDefiningOp(), condBuilder, *pollBlockId, tid);
+    return cond;
   }
 
   // Unexpected loop type: caller falls back with ERRCODE_IGNORED.
