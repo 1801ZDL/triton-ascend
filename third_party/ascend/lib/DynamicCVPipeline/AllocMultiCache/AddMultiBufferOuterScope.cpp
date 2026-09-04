@@ -1200,8 +1200,9 @@ static int processTransferChain(TransferOpChain &chain, Value cond,
 }
 
 /// Create polling condition and builder for a loop op (ForOp or WhileOp).
-/// Returns the condition Value; `builderOut` is set to the insertion point
-/// for subsequent wrapping ops (before the loop terminator).
+/// Returns the condition Value, or null on unexpected loop type;
+/// `builderOut` is set to the insertion point for subsequent wrapping ops
+/// (before the loop terminator).
 static Value prepareLoopPolling(Operation *loopOp, Operation *waitOp,
                                 OpBuilder &builderOut) {
   int bid = getBlockId(waitOp);
@@ -1232,10 +1233,12 @@ static Value prepareLoopPolling(Operation *loopOp, Operation *waitOp,
                                              arith::CmpIPredicate::eq, rem, c0);
   }
 
-  llvm_unreachable("unexpected loop op type");
+  // Unexpected loop type: caller falls back with ERRCODE_IGNORED.
+  return Value();
 }
 
-/// Add polling control flow for all transfer groups
+/// Add polling control flow for all transfer groups.
+/// Returns 0 on success, else a CVPipeline ERRCODE (1=FAILED, 2=IGNORED).
 static int addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups) {
   for (auto &p : groups) {
     TransferGroupInfo &g = p.second;
@@ -1247,12 +1250,19 @@ static int addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups) {
     OpBuilder senderBuilder(senderWaitParent->getContext());
     Value senderCond = prepareLoopPolling(senderWaitParent,
                                           g.senderChain.waitOp, senderBuilder);
+    if (!senderCond) {
+      LDBG("FALLBACK: unexpected sender loop op " << senderWaitParent->getName()
+                                                  << ", rc="
+                                                  << CVPipeline::ERRCODE_IGNORED
+                                                  << ".");
+      return CVPipeline::ERRCODE_IGNORED;
+    }
 
     // Process sender chain (isProducer=true)
     if (processTransferChain(g.senderChain, senderCond, g.senderInputBuffer,
                              g.senderOutputBuffer, g.outputFlag, true,
                              senderBuilder) != 0) {
-      return -1;
+      return CVPipeline::ERRCODE_FAILED;
     }
 
     // Process receiver chain (may use different loop op) (isProducer=false)
@@ -1264,17 +1274,23 @@ static int addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups) {
         if (processTransferChain(g.receiverChain, senderCond,
                                  g.receiverInputBuffer, g.receiverOutputBuffer,
                                  g.outputFlag, false, senderBuilder) != 0) {
-          return -1;
+          return CVPipeline::ERRCODE_FAILED;
         }
       } else {
         // Receiver uses a different loop op, prepare new cond and builder
         OpBuilder receiverBuilder(receiverWaitParent->getContext());
         Value receiverCond = prepareLoopPolling(
             receiverWaitParent, g.receiverChain.waitOp, receiverBuilder);
+        if (!receiverCond) {
+          LDBG("FALLBACK: unexpected receiver loop op "
+               << receiverWaitParent->getName() << ", rc="
+               << CVPipeline::ERRCODE_IGNORED << ".");
+          return CVPipeline::ERRCODE_IGNORED;
+        }
         if (processTransferChain(g.receiverChain, receiverCond,
                                  g.receiverInputBuffer, g.receiverOutputBuffer,
                                  g.outputFlag, false, receiverBuilder) != 0) {
-          return -1;
+          return CVPipeline::ERRCODE_FAILED;
         }
       }
     }
@@ -1419,10 +1435,11 @@ void AddMultiBufferOuterScopePass::runOnOperation() {
     LDBG("[Step 2/3] Done.");
 
     LDBG("[Step 3/3] Start: polling control flow.");
-    if (addPollingControlFlow(groups)) {
+    int pollingRc = addPollingControlFlow(groups);
+    if (pollingRc != 0) {
       LDBG("FALLBACK: Step 3/3 failed, polling control flow failed, rc="
-           << CVPipeline::ERRCODE_FAILED << ".");
-      CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
+           << pollingRc << ".");
+      CVPipeline::setFallbackAttr(module, pollingRc);
       return;
     }
     LDBG("[Step 3/3] Done.");
