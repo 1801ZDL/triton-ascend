@@ -64,18 +64,6 @@ static int getTransferId(Operation *op) {
   return -1;
 }
 
-// --- Address space helpers ---
-
-static bool isInVectorScope(Operation *op) {
-  auto scopeOp = op->getParentOfType<scope::ScopeOp>();
-  if (!scopeOp) {
-    return false;
-  }
-  if (auto tcoreAttr = scopeOp->getAttrOfType<TCoreTypeAttr>("hivm.tcore_type"))
-    return tcoreAttr.getTcoretype() == TCoreType::VECTOR;
-  return false;
-}
-
 // --- main_loop attribute helpers ---
 
 /// Check if a sync op's direct parent is a main_loop op (forOp / whileOp
@@ -398,16 +386,16 @@ static int collectTransferChains(const SmallVector<Operation *> &ops,
       info.sender.setOp =
           findSyncOpWithFlag(block, op, originalFlag, true, false);
       LDBG("Sender chain (VECTOR): hir.copy, flag=" << originalFlag << ".");
-    } else if (isa<memref::MemorySpaceCastOp>(op) && isInVectorScope(op)) {
+    } else if (isa<memref::MemorySpaceCastOp>(op) &&
+               !info.receiver.transferOp) {
       info.receiver.transferOp = op;
       info.receiver.waitOp =
           findSyncOpWithFlag(block, op, originalFlag, false, true);
       info.receiver.setOp =
           findSyncOpWithFlag(block, op, originalFlag, true, false);
       info.receiver.toTensorOp = findToTensorAfter(block, op);
-      LDBG("Receiver chain (VECTOR): memory_space_cast, flag=" << originalFlag
-                                                               << ".");
-    } else if (isa<hivm::ConvertLayoutOp>(op)) {
+      LDBG("Receiver chain: memory_space_cast, flag=" << originalFlag << ".");
+    } else if (isa<hivm::ConvertLayoutOp>(op) && !info.receiver.transferOp) {
       info.receiver.transferOp = op;
       info.receiver.waitOp =
           findSyncOpWithFlag(block, op, originalFlag, false, true);
