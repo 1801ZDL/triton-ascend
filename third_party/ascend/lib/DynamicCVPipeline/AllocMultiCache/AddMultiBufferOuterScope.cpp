@@ -15,6 +15,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "ascend/include/DynamicCVPipeline/Common/BufferCountManager.h"
 #include "ascend/include/DynamicCVPipeline/Common/FlagIdManager.h"
@@ -64,18 +65,6 @@ static int getTransferId(Operation *op) {
   return -1;
 }
 
-// --- Address space helpers ---
-
-static bool isInVectorScope(Operation *op) {
-  auto scopeOp = op->getParentOfType<scope::ScopeOp>();
-  if (!scopeOp) {
-    return false;
-  }
-  if (auto tcoreAttr = scopeOp->getAttrOfType<TCoreTypeAttr>("hivm.tcore_type"))
-    return tcoreAttr.getTcoretype() == TCoreType::VECTOR;
-  return false;
-}
-
 // --- main_loop attribute helpers ---
 
 /// Check if a sync op's direct parent is a main_loop op (forOp / whileOp
@@ -85,6 +74,64 @@ static bool parentOpHasMainLoopAttr(Operation *syncOp) {
     return false;
   }
   return CVPipeline::isMainLoopOp(syncOp->getParentOp());
+}
+
+// --- Tag-driven transfer op classification helpers ---
+
+/// True if op is inside a VECTOR scope; for direction derivation only
+static bool isInsideVectorScope(Operation *op) {
+  auto scopeOp = op->getParentOfType<scope::ScopeOp>();
+  if (!scopeOp) {
+    return false;
+  }
+  if (auto tcoreAttr = scopeOp->getAttrOfType<TCoreTypeAttr>("hivm.tcore_type"))
+    return tcoreAttr.getTcoretype() == TCoreType::VECTOR;
+  return false;
+}
+
+/// True if op declares MemoryEffects Write on buffer
+static bool hasWriteEffectOn(Operation *op, Value buffer) {
+  auto iface = dyn_cast<MemoryEffectOpInterface>(op);
+  if (!iface) {
+    return false;
+  }
+  SmallVector<SideEffects::EffectInstance<MemoryEffects::Effect>> effects;
+  iface.getEffects(effects);
+  return llvm::any_of(effects, [&](const auto &effect) {
+    return isa<MemoryEffects::Write>(effect.getEffect()) &&
+           effect.getValue() == buffer;
+  });
+}
+
+/// Walk single-use memref chain from receiverOp to the first op producing a
+/// tensor. Returns nullptr when:
+/// - head result is not a memref
+/// - chain forks (multi-use), leaves the block, or hits a result-less op
+static Operation *findChainTensorTerminal(Operation *receiverOp) {
+  if (receiverOp->getNumResults() == 0) {
+    return nullptr;
+  }
+  Value cur = receiverOp->getResult(0);
+  Block *block = receiverOp->getBlock();
+  // Terminates: SSA def-use is acyclic; same-block users appear strictly
+  // after their def, so the walk never revisits a value.
+  while (cur && isa<MemRefType>(cur.getType())) {
+    Operation *user = nullptr;
+    for (auto &use : cur.getUses()) {
+      if (user) {
+        return nullptr; // forked chain: ambiguous
+      }
+      user = use.getOwner();
+    }
+    if (!user || user->getBlock() != block || user->getNumResults() == 0) {
+      return nullptr;
+    }
+    if (isa<RankedTensorType>(user->getResult(0).getType())) {
+      return user;
+    }
+    cur = user->getResult(0);
+  }
+  return nullptr;
 }
 
 // --- Operation search helpers ---
@@ -132,20 +179,6 @@ static Operation *findSyncOpWithFlag(Block *block, Operation *start, int flag,
         return op;
       }
     } while (it != block->begin());
-  }
-  return nullptr;
-}
-
-/// Find the to_tensor op after a given op in the same block
-static Operation *findToTensorAfter(Block *block, Operation *start) {
-  if (!block) {
-    return nullptr;
-  }
-  auto it = start->getIterator();
-  for (auto e = block->end(); it != e; ++it) {
-    if (isa<bufferization::ToTensorOp>(&*it)) {
-      return &*it;
-    }
   }
   return nullptr;
 }
@@ -199,32 +232,24 @@ static int collectBufferAllocs(const SmallVector<Operation *> &ops,
     return nullptr;
   };
 
-  // Identify sender's cross-core buffer from transferOp's outs operand
-  if (info.senderChain.transferOp) {
-    Operation *transferOp = info.senderChain.transferOp;
-    // fixpipe / hir.copy: cross-core buffer is the last operand (outs)
-    Value crossCoreBuf =
-        transferOp->getOperand(transferOp->getNumOperands() - 1);
-    if (auto *defOp = crossCoreBuf.getDefiningOp()) {
+  // Cross-core buffer = alloc defining the recorded buffer operand
+  if (info.senderChain.transferOp && info.senderChain.bufferOperand) {
+    if (auto *defOp = info.senderChain.bufferOperand.getDefiningOp()) {
       if (isa<memref::AllocOp>(defOp)) {
         info.senderBuf.allocOp = defOp;
         info.senderBuf.markOp = findMarkForAlloc(defOp);
-        LDBG("Sender cross-core buffer: alloc from transferOp outs.");
+        LDBG("Sender cross-core buffer: alloc from transferOp buffer operand.");
       }
     }
   }
 
-  // Identify receiver's cross-core buffer from transferOp's input operand
-  if (info.receiverChain.transferOp) {
-    Operation *transferOp = info.receiverChain.transferOp;
-    // memref.memory_space_cast / hivm.convert_layout: cross-core buffer is
-    // the first operand
-    Value crossCoreBuf = transferOp->getOperand(0);
-    if (auto *defOp = crossCoreBuf.getDefiningOp()) {
+  if (info.receiverChain.transferOp && info.receiverChain.bufferOperand) {
+    if (auto *defOp = info.receiverChain.bufferOperand.getDefiningOp()) {
       if (isa<memref::AllocOp>(defOp)) {
         info.receiverBuf.allocOp = defOp;
         info.receiverBuf.markOp = findMarkForAlloc(defOp);
-        LDBG("Receiver cross-core buffer: alloc from transferOp input.");
+        LDBG("Receiver cross-core buffer: alloc from transferOp buffer "
+             "operand.");
       }
     }
   }
@@ -370,52 +395,76 @@ static int collectExtraSync(const SmallVector<Operation *> &ops,
   return 0;
 }
 
-/// Collect transfer chain ops (parent has main_loop)
+/// Collect in-loop sender/receiver chains. Tag+dataflow rules:
+/// - group buffer: alloc carrying the transfer_id
+/// - sender: writes a group buffer (Write effect or result-less)
+/// - receiver head: first op reading a group buffer as a value
+/// - no op-type matching; receiver trailing ops found at wrap time
 static int collectTransferChains(const SmallVector<Operation *> &ops,
                                  int originalFlag, TransferChainInfo &info) {
+  // Group buffers: allocs carrying this transfer_id
+  SmallVector<Value> groupBuffers;
+  for (Operation *op : ops) {
+    if (auto allocOp = dyn_cast<memref::AllocOp>(op)) {
+      groupBuffers.push_back(allocOp.getResult());
+    }
+  }
+  auto isGroupBuffer = [&](Value v) {
+    return llvm::is_contained(groupBuffers, v);
+  };
+
   for (Operation *op : ops) {
     if ((isa<hivm::SyncBlockSetOp>(op) || isa<hivm::SyncBlockWaitOp>(op)) ||
         !op->getBlock()) {
+      continue;
+    }
+    // Buffers and annotations are data, not transfer behavior
+    if (isa<memref::AllocOp>(op) || isa<annotation::MarkOp>(op)) {
       continue;
     }
     if (!parentOpHasMainLoopAttr(op)) {
       continue;
     }
 
+    // First operand backed by a group buffer
+    Value bufferOperand;
+    for (Value operand : op->getOperands()) {
+      if (isGroupBuffer(operand)) {
+        bufferOperand = operand;
+        break;
+      }
+    }
+    if (!bufferOperand) {
+      continue;
+    }
+
     Block *block = op->getBlock();
 
-    if (isa<hivm::FixpipeOp>(op)) {
+    if (op->getNumResults() == 0 || hasWriteEffectOn(op, bufferOperand)) {
+      // Writes the cross-core buffer → sender
+      if (info.sender.transferOp) {
+        continue;
+      }
       info.sender.transferOp = op;
+      info.sender.bufferOperand = bufferOperand;
       info.sender.waitOp =
           findSyncOpWithFlag(block, op, originalFlag, false, true);
       info.sender.setOp =
           findSyncOpWithFlag(block, op, originalFlag, true, false);
-      LDBG("Sender chain (CUBE): fixpipe, flag=" << originalFlag << ".");
-    } else if (isa<hivm::CopyOp>(op)) {
-      info.sender.transferOp = op;
-      info.sender.waitOp =
-          findSyncOpWithFlag(block, op, originalFlag, false, true);
-      info.sender.setOp =
-          findSyncOpWithFlag(block, op, originalFlag, true, false);
-      LDBG("Sender chain (VECTOR): hir.copy, flag=" << originalFlag << ".");
-    } else if (isa<memref::MemorySpaceCastOp>(op) && isInVectorScope(op)) {
+      LDBG("Sender chain (tag-driven): " << op->getName()
+                                         << ", flag=" << originalFlag << ".");
+    } else if (!info.receiver.transferOp) {
+      // Reads the cross-core buffer as a value → receiver head
       info.receiver.transferOp = op;
+      info.receiver.bufferOperand = bufferOperand;
       info.receiver.waitOp =
           findSyncOpWithFlag(block, op, originalFlag, false, true);
       info.receiver.setOp =
           findSyncOpWithFlag(block, op, originalFlag, true, false);
-      info.receiver.toTensorOp = findToTensorAfter(block, op);
-      LDBG("Receiver chain (VECTOR): memory_space_cast, flag=" << originalFlag
-                                                               << ".");
-    } else if (isa<hivm::ConvertLayoutOp>(op)) {
-      info.receiver.transferOp = op;
-      info.receiver.waitOp =
-          findSyncOpWithFlag(block, op, originalFlag, false, true);
-      info.receiver.setOp =
-          findSyncOpWithFlag(block, op, originalFlag, true, false);
-      info.receiver.toTensorOp = findToTensorAfter(block, op);
-      LDBG("Receiver chain (CUBE): convert_layout, flag=" << originalFlag
-                                                          << ".");
+      info.receiver.toTensorOp = findChainTensorTerminal(op);
+      LDBG("Receiver chain (tag-driven): "
+           << op->getName() << ", flag=" << originalFlag << ", toTensorOp="
+           << (info.receiver.toTensorOp ? "found" : "none") << ".");
     }
   }
 
@@ -464,13 +513,13 @@ static int buildTransferGroupData(int tid, const SmallVector<Operation *> &ops,
   info.senderChain = chainInfo.sender;
   info.receiverChain = chainInfo.receiver;
 
-  // 4. Determine direction
+  // 4. Direction from the executing core's scope:
+  // - sender in VECTOR scope: V→C; in CUBE scope: C→V
+  // - no sender: derive from receiver scope instead
   if (info.senderChain.transferOp) {
-    if (isa<hivm::FixpipeOp>(info.senderChain.transferOp)) {
-      info.isCtoV = true;
-    } else if (isa<hivm::CopyOp>(info.senderChain.transferOp)) {
-      info.isCtoV = false;
-    }
+    info.isCtoV = !isInsideVectorScope(info.senderChain.transferOp);
+  } else if (info.receiverChain.transferOp) {
+    info.isCtoV = isInsideVectorScope(info.receiverChain.transferOp);
   }
 
   // 5. Collect buffer alloc/mark pairs from transfer ops
@@ -910,9 +959,11 @@ static Operation *wrapSyncOpWithScfIf(
   return ifOp.getOperation();
 }
 
-/// Wrap a transfer op (with external uses) in scf.if with yield
+/// Wrap transfer op (with external uses) in scf.if with yield:
+/// - then: clone with the original buffer operand
+/// - else: clone with bufferOperand remapped to the spare buffer
 static Operation *wrapTransferOpWithScfIfYield(Operation *transferOp,
-                                               Value cond, Value inputBuffer,
+                                               Value cond, Value bufferOperand,
                                                Value outputBuffer, int bid,
                                                int tid, bool isProducer,
                                                OpBuilder &builder) {
@@ -923,16 +974,11 @@ static Operation *wrapTransferOpWithScfIfYield(Operation *transferOp,
   auto ifOp = builder.create<scf::IfOp>(loc, transferOp->getResultTypes(), cond,
                                         true /* withElseRegion */);
 
-  // then branch: use inputBuffer
+  // then branch: keep the original buffer operand
   Operation *thenCloned = nullptr;
   {
     auto thenBuilder = ifOp.getThenBodyBuilder();
-    IRMapping inputMap;
-    if (transferOp->getNumOperands() > 0) {
-      inputMap.map(transferOp->getOperand(transferOp->getNumOperands() - 1),
-                   inputBuffer);
-    }
-    thenCloned = thenBuilder.clone(*transferOp, inputMap);
+    thenCloned = thenBuilder.clone(*transferOp);
     thenBuilder.create<scf::YieldOp>(loc, thenCloned->getResults());
   }
 
@@ -941,9 +987,8 @@ static Operation *wrapTransferOpWithScfIfYield(Operation *transferOp,
   {
     auto elseBuilder = ifOp.getElseBodyBuilder();
     IRMapping outputMap;
-    if (transferOp->getNumOperands() > 0) {
-      outputMap.map(transferOp->getOperand(transferOp->getNumOperands() - 1),
-                    outputBuffer);
+    if (bufferOperand) {
+      outputMap.map(bufferOperand, outputBuffer);
     }
     elseCloned = elseBuilder.clone(*transferOp, outputMap);
     elseBuilder.create<scf::YieldOp>(loc, elseCloned->getResults());
@@ -976,7 +1021,7 @@ static Operation *wrapTransferOpWithScfIfYield(Operation *transferOp,
 
 /// Wrap a transfer op (no external uses) in scf.if without yield
 static Operation *wrapTransferOpWithScfIfSimple(Operation *transferOp,
-                                                Value cond, Value inputBuffer,
+                                                Value cond, Value bufferOperand,
                                                 Value outputBuffer, int bid,
                                                 int tid, bool isProducer,
                                                 OpBuilder &builder) {
@@ -987,7 +1032,7 @@ static Operation *wrapTransferOpWithScfIfSimple(Operation *transferOp,
   auto ifOp = builder.create<scf::IfOp>(loc, TypeRange{}, cond,
                                         true /* withElseRegion */);
 
-  // then branch: clone directly
+  // then branch: clone directly (keeps the original buffer operand)
   Operation *thenCloned = nullptr;
   {
     auto thenBuilder = ifOp.getThenBodyBuilder();
@@ -999,9 +1044,8 @@ static Operation *wrapTransferOpWithScfIfSimple(Operation *transferOp,
   {
     auto elseBuilder = ifOp.getElseBodyBuilder();
     IRMapping outputMap;
-    if (transferOp->getNumOperands() > 0) {
-      outputMap.map(transferOp->getOperand(transferOp->getNumOperands() - 1),
-                    outputBuffer);
+    if (bufferOperand) {
+      outputMap.map(bufferOperand, outputBuffer);
     }
     elseCloned = elseBuilder.clone(*transferOp, outputMap);
   }
@@ -1025,11 +1069,11 @@ static Operation *wrapTransferOpWithScfIfSimple(Operation *transferOp,
   return ifOp.getOperation();
 }
 
-/// Wrap a receiver transfer chain (transferOp + trailing memspace_cast +
-/// to_tensor) in scf.if so that the if returns tensor type directly.
+/// Wrap receiver chain (head + trailing ops + tensor boundary) in scf.if
+/// returning tensor
 static Operation *wrapReceiverChainWithScfIf(Operation *transferOp,
                                              Operation *toTensorOp, Value cond,
-                                             Value inputBuffer,
+                                             Value bufferOperand,
                                              Value outputBuffer, int bid,
                                              int tid, OpBuilder &builder) {
   OpBuilder::InsertionGuard guard(builder);
@@ -1061,21 +1105,17 @@ static Operation *wrapReceiverChainWithScfIf(Operation *transferOp,
   auto ifOp = builder.create<scf::IfOp>(loc, tensorType, cond,
                                         true /* withElseRegion */);
 
-  // then branch: use inputBuffer → clone chain + to_tensor
+  // then branch: keep the original buffer operand → clone chain + boundary
   {
     auto thenBuilder = ifOp.getThenBodyBuilder();
-    IRMapping inputMap;
-    if (transferOp->getNumOperands() > 0)
-      inputMap.map(transferOp->getOperand(transferOp->getNumOperands() - 1),
-                   inputBuffer);
-    Operation *clonedTransfer = thenBuilder.clone(*transferOp, inputMap);
+    IRMapping thenMapper;
+    Operation *clonedTransfer = thenBuilder.clone(*transferOp, thenMapper);
     // Strip crossDeps from the cloned transferOp: clone() inherits attrs
     // from the original (which may carry [tid, 0] from upstream tagging),
     // but consumer role is owned by the ifOp wrapper below. Inner clone
     // must stay clean.
     clonedTransfer->removeAttr(mlir::CVPipeline::kCrossCoreDeps);
     Value chainResult = clonedTransfer->getResult(0);
-    auto thenMapper = inputMap;
     thenMapper.map(transferOp->getResult(0), chainResult);
     for (Operation *op : trailingOps) {
       Operation *cloned = thenBuilder.clone(*op, thenMapper);
@@ -1087,13 +1127,13 @@ static Operation *wrapReceiverChainWithScfIf(Operation *transferOp,
     thenBuilder.create<scf::YieldOp>(loc, clonedToTensor->getResult(0));
   }
 
-  // else branch: use outputBuffer → clone chain + to_tensor
+  // else branch: use outputBuffer → clone chain + boundary
   {
     auto elseBuilder = ifOp.getElseBodyBuilder();
     IRMapping outputMap;
-    if (transferOp->getNumOperands() > 0)
-      outputMap.map(transferOp->getOperand(transferOp->getNumOperands() - 1),
-                    outputBuffer);
+    if (bufferOperand) {
+      outputMap.map(bufferOperand, outputBuffer);
+    }
     Operation *clonedTransfer = elseBuilder.clone(*transferOp, outputMap);
     clonedTransfer->removeAttr(mlir::CVPipeline::kCrossCoreDeps);
     Value chainResult = clonedTransfer->getResult(0);
@@ -1129,9 +1169,8 @@ static Operation *wrapReceiverChainWithScfIf(Operation *transferOp,
 
 /// Process polling for a sender or receiver transfer chain
 static int processTransferChain(TransferOpChain &chain, Value cond,
-                                Value inputBuffer, Value outputBuffer,
-                                int outputFlag, bool isProducer,
-                                OpBuilder &builder) {
+                                Value outputBuffer, int outputFlag,
+                                bool isProducer, OpBuilder &builder) {
   if (!chain.waitOp) {
     return -1;
   }
@@ -1150,20 +1189,19 @@ static int processTransferChain(TransferOpChain &chain, Value cond,
             .getOperation();
       });
 
-  // 2. Wrap transferOp in polling if (then=use inputBuffer, else=use
-  // outputBuffer)
+  // 2. Wrap transferOp in polling if (then=original buffer, else=outputBuffer)
   if (chain.transferOp) {
     int bid = getBlockId(chain.transferOp);
     int tid = getTransferId(chain.transferOp);
 
-    // For receiver chains with toTensorOp, wrap the full chain
-    // (transferOp → memspace_cast → to_tensor) so the scf.if returns tensor.
-    if (!isProducer && chain.toTensorOp) {
+    // Receiver with boundary op: wrap the whole chain so scf.if yields tensor
+    if (!isProducer && chain.toTensorOp &&
+        chain.toTensorOp != chain.transferOp) {
       LDBG("transferOp: " << chain.transferOp->getName()
                           << " (receiver, wrapping to_tensor).");
       chain.transferOp = wrapReceiverChainWithScfIf(
-          chain.transferOp, chain.toTensorOp, cond, inputBuffer, outputBuffer,
-          bid, tid, builder);
+          chain.transferOp, chain.toTensorOp, cond, chain.bufferOperand,
+          outputBuffer, bid, tid, builder);
       chain.toTensorOp = nullptr;
     } else {
       bool hasExternalUses = !chain.transferOp->getResults().empty() &&
@@ -1175,11 +1213,11 @@ static int processTransferChain(TransferOpChain &chain, Value cond,
       chain.transferOp =
           hasExternalUses
               ? wrapTransferOpWithScfIfYield(chain.transferOp, cond,
-                                             inputBuffer, outputBuffer, bid,
-                                             tid, isProducer, builder)
+                                             chain.bufferOperand, outputBuffer,
+                                             bid, tid, isProducer, builder)
               : wrapTransferOpWithScfIfSimple(chain.transferOp, cond,
-                                              inputBuffer, outputBuffer, bid,
-                                              tid, isProducer, builder);
+                                              chain.bufferOperand, outputBuffer,
+                                              bid, tid, isProducer, builder);
     }
   }
 
@@ -1248,9 +1286,8 @@ static int addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups) {
                                           g.senderChain.waitOp, senderBuilder);
 
     // Process sender chain (isProducer=true)
-    if (processTransferChain(g.senderChain, senderCond, g.senderInputBuffer,
-                             g.senderOutputBuffer, g.outputFlag, true,
-                             senderBuilder) != 0) {
+    if (processTransferChain(g.senderChain, senderCond, g.senderOutputBuffer,
+                             g.outputFlag, true, senderBuilder) != 0) {
       return -1;
     }
 
@@ -1261,8 +1298,8 @@ static int addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups) {
       if (receiverWaitParent == senderWaitParent) {
         // Use the same cond and builder
         if (processTransferChain(g.receiverChain, senderCond,
-                                 g.receiverInputBuffer, g.receiverOutputBuffer,
-                                 g.outputFlag, false, senderBuilder) != 0) {
+                                 g.receiverOutputBuffer, g.outputFlag, false,
+                                 senderBuilder) != 0) {
           return -1;
         }
       } else {
@@ -1271,8 +1308,8 @@ static int addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups) {
         Value receiverCond = prepareLoopPolling(
             receiverWaitParent, g.receiverChain.waitOp, receiverBuilder);
         if (processTransferChain(g.receiverChain, receiverCond,
-                                 g.receiverInputBuffer, g.receiverOutputBuffer,
-                                 g.outputFlag, false, receiverBuilder) != 0) {
+                                 g.receiverOutputBuffer, g.outputFlag, false,
+                                 receiverBuilder) != 0) {
           return -1;
         }
       }
