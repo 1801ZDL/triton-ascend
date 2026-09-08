@@ -1311,17 +1311,57 @@ static Value prepareLoopPolling(Operation *loopOp, Operation *waitOp,
 }
 
 /// Add polling control flow for all transfer groups
+/// Get or create the polling condition shared by all groups rotating buffers
+/// on one loop. The parity value ((iter%2)==0) is identical for every group,
+/// so one scalar condition chain per loop suffices; anchorWait (the earliest
+/// wait in the loop) guarantees the cond dominates every group's scf.if.
+static Value getOrCreateLoopCond(Operation *loopOp, Operation *anchorWait,
+                                 DenseMap<Operation *, Value> &condCache) {
+  auto it = condCache.find(loopOp);
+  if (it != condCache.end()) {
+    return it->second;
+  }
+  OpBuilder builder(loopOp->getContext());
+  Value cond = prepareLoopPolling(loopOp, anchorWait, builder);
+  if (cond) {
+    condCache[loopOp] = cond;
+    LDBG("Shared polling cond created for loop, tagged by anchor wait.");
+  }
+  return cond;
+}
+
 static int addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups) {
+  // Anchor per loop: the earliest wait across all groups — the shared cond
+  // must dominate every group's scf.if wrappers.
+  DenseMap<Operation *, Operation *> loopAnchor;
+  for (auto &p : groups) {
+    TransferGroupInfo &g = p.second;
+    auto track = [&](Operation *waitOp) {
+      if (!waitOp) {
+        return;
+      }
+      Operation *loop = waitOp->getParentOp();
+      Operation *&anchor = loopAnchor[loop];
+      if (!anchor || (waitOp->getBlock() == anchor->getBlock() &&
+                      waitOp->isBeforeInBlock(anchor))) {
+        anchor = waitOp;
+      }
+    };
+    track(g.senderChain.waitOp);
+    track(g.receiverChain.waitOp);
+  }
+
+  DenseMap<Operation *, Value> condCache;
   for (auto &p : groups) {
     TransferGroupInfo &g = p.second;
 
     // Get sender's loop op (ForOp or WhileOp)
     Operation *senderWaitParent = g.senderChain.waitOp->getParentOp();
 
-    // Prepare polling condition and builder for sender loop
+    // Shared polling condition for the sender loop
     OpBuilder senderBuilder(senderWaitParent->getContext());
-    Value senderCond = prepareLoopPolling(senderWaitParent,
-                                          g.senderChain.waitOp, senderBuilder);
+    Value senderCond = getOrCreateLoopCond(
+        senderWaitParent, loopAnchor[senderWaitParent], condCache);
     if (!senderCond) {
       LDBG("FALLBACK: unexpected sender loop op "
            << senderWaitParent->getName()
@@ -1347,10 +1387,10 @@ static int addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups) {
           return CVPipeline::ERRCODE_FAILED;
         }
       } else {
-        // Receiver uses a different loop op, prepare new cond and builder
+        // Receiver uses a different loop op, share its cond too
         OpBuilder receiverBuilder(receiverWaitParent->getContext());
-        Value receiverCond = prepareLoopPolling(
-            receiverWaitParent, g.receiverChain.waitOp, receiverBuilder);
+        Value receiverCond = getOrCreateLoopCond(
+            receiverWaitParent, loopAnchor[receiverWaitParent], condCache);
         if (!receiverCond) {
           LDBG("FALLBACK: unexpected receiver loop op "
                << receiverWaitParent->getName()
