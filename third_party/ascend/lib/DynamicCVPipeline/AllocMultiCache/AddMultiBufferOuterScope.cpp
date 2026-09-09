@@ -900,12 +900,10 @@ static Value ensureWhileOpHasCounter(scf::WhileOp whileOp) {
           ab.clone(op, map);
 
         auto oldYield = cast<scf::YieldOp>(oldAfter->getTerminator());
-        Operation *oneOp = ab.create<arith::ConstantIntOp>(al, 1, 32);
-        Value one = oneOp->getResult(0);
-        Operation *addOp = ab.create<arith::AddIOp>(al, counterIterArg, one);
-        counterOne = oneOp;
-        counterAdd = addOp;
-        Value nextCounter = addOp->getResult(0);
+        counterOne = ab.create<arith::ConstantIntOp>(al, 1, kBits32);
+        counterAdd = ab.create<arith::AddIOp>(al, counterIterArg,
+                                              counterOne->getResult(0));
+        Value nextCounter = counterAdd->getResult(0);
         SmallVector<Value> yOps;
         for (Value v : oldYield.getOperands())
           yOps.push_back(map.lookupOrDefault(v));
@@ -1253,8 +1251,7 @@ static LogicalResult processTransferChain(TransferOpChain &chain, Value cond,
     int tid = getTransferId(chain.transferOp);
 
     // Receiver with boundary op: wrap the whole chain so scf.if yields tensor
-    if (!isProducer && chain.toTensorOp &&
-        chain.toTensorOp != chain.transferOp) {
+    if (!isProducer && chain.toTensorOp) {
       LDBG("transferOp: " << chain.transferOp->getName()
                           << " (receiver, wrapping to_tensor).");
       chain.transferOp = wrapReceiverChainWithScfIf(
@@ -1324,13 +1321,13 @@ static Value prepareLoopPolling(Operation *loopOp, Operation *waitOp,
       pollBlockId = bid;
     OpBuilder condBuilder(builderOut);
     Operation *c2Op =
-        condBuilder.create<arith::ConstantIntOp>(whileOp.getLoc(), 2, 32);
+        condBuilder.create<arith::ConstantIntOp>(whileOp.getLoc(), 2, kBits32);
     setSsbufferTags(c2Op, condBuilder, *pollBlockId, tid);
     Operation *remOp = condBuilder.create<arith::RemSIOp>(
         whileOp.getLoc(), counter, c2Op->getResult(0));
     setSsbufferTags(remOp, condBuilder, *pollBlockId, tid);
     Operation *c0Op =
-        condBuilder.create<arith::ConstantIntOp>(whileOp.getLoc(), 0, 32);
+        condBuilder.create<arith::ConstantIntOp>(whileOp.getLoc(), 0, kBits32);
     setSsbufferTags(c0Op, condBuilder, *pollBlockId, tid);
     Operation *condOp = condBuilder.create<arith::CmpIOp>(
         whileOp.getLoc(), arith::CmpIPredicate::eq, remOp->getResult(0),
