@@ -37,15 +37,9 @@ using namespace triton;
 
 // Functions that should use at most double buffering.
 static const llvm::SmallVector<llvm::StringRef> kBlacklistFuncNames = {
-    "sdf02_tc01_c2v_war",
-    "sdf02_tc02_c2v_war",
     "_attn_fwd",
     "kernel_sdpa_fwd",
     "kernel_sdpa_bwd_q",
-    "pcb08_tc01_kernel",
-    "pcb08_tc02_kernel",
-    "pcb09_tc01_kernel",
-    "pcb09_tc02_kernel",
     "_swa_paged_decode_kernel",
     "_mqa_logits_kernel",
     "parallel_path_fwd_kernel",
