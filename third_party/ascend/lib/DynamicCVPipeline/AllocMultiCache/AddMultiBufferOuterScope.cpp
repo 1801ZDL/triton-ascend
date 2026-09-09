@@ -116,22 +116,37 @@ static Operation *findChainTensorTerminal(Operation *receiverOp) {
   // Terminates: SSA def-use is acyclic; same-block users appear strictly
   // after their def, so the walk never revisits a value.
   while (cur && isa<MemRefType>(cur.getType())) {
-    Operation *user = nullptr;
-    for (auto &use : cur.getUses()) {
-      if (user) {
-        return nullptr; // forked chain: ambiguous
-      }
-      user = use.getOwner();
+    if (!cur.hasOneUse()) {
+      return nullptr; // forked chain: ambiguous
     }
-    if (!user || user->getBlock() != block || user->getNumResults() == 0) {
+    Operation *user = *cur.getUsers().begin();
+    if (user->getBlock() != block || user->getNumResults() == 0) {
       return nullptr;
     }
-    if (isa<RankedTensorType>(user->getResult(0).getType())) {
+    Value result = user->getResult(0);
+    if (isa<RankedTensorType>(result.getType())) {
       return user;
     }
-    cur = user->getResult(0);
+    cur = result;
   }
   return nullptr;
+}
+
+/// First block_id found in a block's ops, if any
+static std::optional<int> getFirstBlockId(Block *block) {
+  for (Operation &op : *block)
+    if (auto id = CVPipeline::getOpBlockId(&op))
+      return id;
+  return std::nullopt;
+}
+
+/// Last block_id found in a block's ops, if any
+static std::optional<int> getLastBlockId(Block *block) {
+  std::optional<int> last;
+  for (Operation &op : *block)
+    if (auto id = CVPipeline::getOpBlockId(&op))
+      last = id;
+  return last;
 }
 
 // --- Operation search helpers ---
@@ -402,7 +417,8 @@ static int collectExtraSync(const SmallVector<Operation *> &ops,
 /// - no op-type matching; receiver trailing ops found at wrap time
 static int collectTransferChains(const SmallVector<Operation *> &ops,
                                  int originalFlag, TransferChainInfo &info) {
-  // Group buffers: allocs carrying this transfer_id
+  // Group buffers: allocs carrying this transfer_id, one per core (sender and
+  // receiver sides each own one physical buffer)
   SmallVector<Value> groupBuffers;
   for (Operation *op : ops) {
     if (auto allocOp = dyn_cast<memref::AllocOp>(op)) {
@@ -453,7 +469,7 @@ static int collectTransferChains(const SmallVector<Operation *> &ops,
           findSyncOpWithFlag(block, op, originalFlag, true, false);
       LDBG("Sender chain (tag-driven): " << op->getName()
                                          << ", flag=" << originalFlag << ".");
-    } else if (!info.receiver.transferOp) {
+    } else if (!info.receiver.transferOp && op->getNumResults() > 0) {
       // Reads the cross-core buffer as a value → receiver head
       info.receiver.transferOp = op;
       info.receiver.bufferOperand = bufferOperand;
@@ -861,10 +877,12 @@ static Value ensureWhileOpHasCounter(scf::WhileOp whileOp) {
           ab.clone(op, map);
 
         auto oldYield = cast<scf::YieldOp>(oldAfter->getTerminator());
-        Value one = ab.create<arith::ConstantIntOp>(al, 1, 32);
-        Value nextCounter = ab.create<arith::AddIOp>(al, counterIterArg, one);
-        counterOne = one.getDefiningOp();
-        counterAdd = nextCounter.getDefiningOp();
+        Operation *oneOp = ab.create<arith::ConstantIntOp>(al, 1, 32);
+        Value one = oneOp->getResult(0);
+        Operation *addOp = ab.create<arith::AddIOp>(al, counterIterArg, one);
+        counterOne = oneOp;
+        counterAdd = addOp;
+        Value nextCounter = addOp->getResult(0);
         SmallVector<Value> yOps;
         for (Value v : oldYield.getOperands())
           yOps.push_back(map.lookupOrDefault(v));
@@ -881,12 +899,8 @@ static Value ensureWhileOpHasCounter(scf::WhileOp whileOp) {
   // CloneOps' block-id contiguity check holds (mirrors InnerScope's
   // insertWhileCounterOps).
   Block &afterBody = newWhile.getAfter().front();
-  std::optional<int> lastBlockId;
-  for (Operation &op : afterBody) {
-    if (auto id = CVPipeline::getOpBlockId(&op))
-      lastBlockId = *id;
-  }
-  if (lastBlockId && counterOne && counterAdd) {
+  if (std::optional<int> lastBlockId = getLastBlockId(&afterBody);
+      lastBlockId && counterOne && counterAdd) {
     IntegerAttr blockIdAttr = builder.getI32IntegerAttr(*lastBlockId);
     counterOne->setAttr(CVPipeline::kBlockId, blockIdAttr);
     counterAdd->setAttr(CVPipeline::kBlockId, blockIdAttr);
@@ -908,24 +922,25 @@ static Value createPollingCondition(scf::ForOp forOp, OpBuilder &builder,
   Value iterVar = forOp.getInductionVar();
   Value step = forOp.getStep();
 
-  auto divOp = builder.create<arith::DivSIOp>(loc, iterVar, step);
-  setSsbufferTags(divOp.getOperation(), builder, blockId, tid);
+  Operation *divOp = builder.create<arith::DivSIOp>(loc, iterVar, step);
+  setSsbufferTags(divOp, builder, blockId, tid);
 
-  Type counterType = divOp.getResult().getType();
+  Type counterType = divOp->getResult(0).getType();
   int bitWidth = counterType.getIntOrFloatBitWidth();
-  auto c2Val = builder.create<arith::ConstantIntOp>(loc, 2, bitWidth);
-  setSsbufferTags(c2Val.getOperation(), builder, blockId, tid);
-  auto remOp =
-      builder.create<arith::RemSIOp>(loc, divOp.getResult(), c2Val.getResult());
-  setSsbufferTags(remOp.getOperation(), builder, blockId, tid);
+  Operation *c2ValOp = builder.create<arith::ConstantIntOp>(loc, 2, bitWidth);
+  setSsbufferTags(c2ValOp, builder, blockId, tid);
+  Operation *remOp = builder.create<arith::RemSIOp>(loc, divOp->getResult(0),
+                                                    c2ValOp->getResult(0));
+  setSsbufferTags(remOp, builder, blockId, tid);
 
-  auto c0Val = builder.create<arith::ConstantIntOp>(loc, 0, bitWidth);
-  auto cmpOp = builder.create<arith::CmpIOp>(
-      loc, arith::CmpIPredicate::eq, remOp.getResult(), c0Val.getResult());
-  setSsbufferTags(cmpOp.getOperation(), builder, blockId, tid);
-  setSsbufferTags(c0Val.getOperation(), builder, blockId, tid);
+  Operation *c0ValOp = builder.create<arith::ConstantIntOp>(loc, 0, bitWidth);
+  Operation *cmpOp =
+      builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+                                    remOp->getResult(0), c0ValOp->getResult(0));
+  setSsbufferTags(cmpOp, builder, blockId, tid);
+  setSsbufferTags(c0ValOp, builder, blockId, tid);
 
-  return cmpOp.getResult();
+  return cmpOp->getResult(0);
 }
 
 /// Wrap a sync op (wait/set) in scf.if: then=clone original, else=create
@@ -1188,11 +1203,11 @@ static Operation *wrapReceiverChainWithScfIf(Operation *transferOp,
 }
 
 /// Process polling for a sender or receiver transfer chain
-static int processTransferChain(TransferOpChain &chain, Value cond,
-                                Value outputBuffer, int outputFlag,
-                                bool isProducer, OpBuilder &builder) {
+static LogicalResult processTransferChain(TransferOpChain &chain, Value cond,
+                                          Value outputBuffer, int outputFlag,
+                                          bool isProducer, OpBuilder &builder) {
   if (!chain.waitOp) {
-    return -1;
+    return failure();
   }
 
   Location loc = chain.waitOp->getLoc();
@@ -1254,7 +1269,7 @@ static int processTransferChain(TransferOpChain &chain, Value cond,
               .getOperation();
         });
   }
-  return 0;
+  return success();
 }
 
 /// Create polling condition and builder for a loop op (ForOp or WhileOp).
@@ -1281,29 +1296,24 @@ static Value prepareLoopPolling(Operation *loopOp, Operation *waitOp,
     builderOut.setInsertionPointToStart(&after);
     // Tag the condition ops with the first body block_id so the
     // block-id contiguity check in CloneOps holds.
-    std::optional<int> pollBlockId;
-    for (Operation &op : after) {
-      if (auto id = CVPipeline::getOpBlockId(&op)) {
-        pollBlockId = *id;
-        break;
-      }
-    }
+    std::optional<int> pollBlockId = getFirstBlockId(&after);
     if (!pollBlockId)
       pollBlockId = bid;
     OpBuilder condBuilder(builderOut);
-    Value c2 =
+    Operation *c2Op =
         condBuilder.create<arith::ConstantIntOp>(whileOp.getLoc(), 2, 32);
-    setSsbufferTags(c2.getDefiningOp(), condBuilder, *pollBlockId, tid);
-    Value rem =
-        condBuilder.create<arith::RemSIOp>(whileOp.getLoc(), counter, c2);
-    setSsbufferTags(rem.getDefiningOp(), condBuilder, *pollBlockId, tid);
-    Value c0 =
+    setSsbufferTags(c2Op, condBuilder, *pollBlockId, tid);
+    Operation *remOp = condBuilder.create<arith::RemSIOp>(
+        whileOp.getLoc(), counter, c2Op->getResult(0));
+    setSsbufferTags(remOp, condBuilder, *pollBlockId, tid);
+    Operation *c0Op =
         condBuilder.create<arith::ConstantIntOp>(whileOp.getLoc(), 0, 32);
-    setSsbufferTags(c0.getDefiningOp(), condBuilder, *pollBlockId, tid);
-    Value cond = condBuilder.create<arith::CmpIOp>(
-        whileOp.getLoc(), arith::CmpIPredicate::eq, rem, c0);
-    setSsbufferTags(cond.getDefiningOp(), condBuilder, *pollBlockId, tid);
-    return cond;
+    setSsbufferTags(c0Op, condBuilder, *pollBlockId, tid);
+    Operation *condOp = condBuilder.create<arith::CmpIOp>(
+        whileOp.getLoc(), arith::CmpIPredicate::eq, remOp->getResult(0),
+        c0Op->getResult(0));
+    setSsbufferTags(condOp, condBuilder, *pollBlockId, tid);
+    return condOp->getResult(0);
   }
 
   // Unexpected loop type: caller falls back with ERRCODE_IGNORED.
@@ -1330,7 +1340,16 @@ static Value getOrCreateLoopCond(Operation *loopOp, Operation *anchorWait,
   return cond;
 }
 
-static int addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups) {
+/// Enclosing loop op (ForOp/WhileOp) of a sync op; the sync may sit inside
+/// scf.if wrappers
+static Operation *resolveLoopOp(Operation *op) {
+  if (auto forOp = op->getParentOfType<scf::ForOp>())
+    return forOp;
+  return op->getParentOfType<scf::WhileOp>();
+}
+
+static LogicalResult
+addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups, int &errCode) {
   // Anchor per loop: the earliest wait across all groups — the shared cond
   // must dominate every group's scf.if wrappers.
   DenseMap<Operation *, Operation *> loopAnchor;
@@ -1340,11 +1359,11 @@ static int addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups) {
       if (!waitOp) {
         return;
       }
-      Operation *loop = waitOp->getParentOp();
-      Operation *&anchor = loopAnchor[loop];
+      Operation *loop = resolveLoopOp(waitOp);
+      Operation *anchor = loopAnchor.lookup(loop);
       if (!anchor || (waitOp->getBlock() == anchor->getBlock() &&
                       waitOp->isBeforeInBlock(anchor))) {
-        anchor = waitOp;
+        loopAnchor[loop] = waitOp;
       }
     };
     track(g.senderChain.waitOp);
@@ -1356,7 +1375,7 @@ static int addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups) {
     TransferGroupInfo &g = p.second;
 
     // Get sender's loop op (ForOp or WhileOp)
-    Operation *senderWaitParent = g.senderChain.waitOp->getParentOp();
+    Operation *senderWaitParent = resolveLoopOp(g.senderChain.waitOp);
 
     // Shared polling condition for the sender loop
     OpBuilder senderBuilder(senderWaitParent->getContext());
@@ -1366,25 +1385,29 @@ static int addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups) {
       LDBG("FALLBACK: unexpected sender loop op "
            << senderWaitParent->getName()
            << ", rc=" << CVPipeline::ERRCODE_IGNORED << ".");
-      return CVPipeline::ERRCODE_IGNORED;
+      errCode = CVPipeline::ERRCODE_IGNORED;
+      return failure();
     }
 
     // Process sender chain (isProducer=true)
-    if (processTransferChain(g.senderChain, senderCond, g.senderOutputBuffer,
-                             g.outputFlag, true, senderBuilder) != 0) {
-      return CVPipeline::ERRCODE_FAILED;
+    if (failed(processTransferChain(g.senderChain, senderCond,
+                                    g.senderOutputBuffer, g.outputFlag, true,
+                                    senderBuilder))) {
+      errCode = CVPipeline::ERRCODE_FAILED;
+      return failure();
     }
 
     // Process receiver chain (may use different loop op) (isProducer=false)
     if (g.receiverChain.waitOp) {
-      Operation *receiverWaitParent = g.receiverChain.waitOp->getParentOp();
+      Operation *receiverWaitParent = resolveLoopOp(g.receiverChain.waitOp);
 
       if (receiverWaitParent == senderWaitParent) {
         // Use the same cond and builder
-        if (processTransferChain(g.receiverChain, senderCond,
-                                 g.receiverOutputBuffer, g.outputFlag, false,
-                                 senderBuilder) != 0) {
-          return CVPipeline::ERRCODE_FAILED;
+        if (failed(processTransferChain(g.receiverChain, senderCond,
+                                        g.receiverOutputBuffer, g.outputFlag,
+                                        false, senderBuilder))) {
+          errCode = CVPipeline::ERRCODE_FAILED;
+          return failure();
         }
       } else {
         // Receiver uses a different loop op, share its cond too
@@ -1395,17 +1418,19 @@ static int addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups) {
           LDBG("FALLBACK: unexpected receiver loop op "
                << receiverWaitParent->getName()
                << ", rc=" << CVPipeline::ERRCODE_IGNORED << ".");
-          return CVPipeline::ERRCODE_IGNORED;
+          errCode = CVPipeline::ERRCODE_IGNORED;
+          return failure();
         }
-        if (processTransferChain(g.receiverChain, receiverCond,
-                                 g.receiverOutputBuffer, g.outputFlag, false,
-                                 receiverBuilder) != 0) {
-          return CVPipeline::ERRCODE_FAILED;
+        if (failed(processTransferChain(g.receiverChain, receiverCond,
+                                        g.receiverOutputBuffer, g.outputFlag,
+                                        false, receiverBuilder))) {
+          errCode = CVPipeline::ERRCODE_FAILED;
+          return failure();
         }
       }
     }
   }
-  return 0;
+  return success();
 }
 
 // ============================================================================
@@ -1545,8 +1570,8 @@ void AddMultiBufferOuterScopePass::runOnOperation() {
     LDBG("[Step 2/3] Done.");
 
     LDBG("[Step 3/3] Start: polling control flow.");
-    int pollingRc = addPollingControlFlow(groups);
-    if (pollingRc != 0) {
+    int pollingRc = CVPipeline::ERRCODE_FAILED;
+    if (failed(addPollingControlFlow(groups, pollingRc))) {
       LDBG("FALLBACK: Step 3/3 failed, polling control flow failed, rc="
            << pollingRc << ".");
       CVPipeline::setFallbackAttr(module, pollingRc);
