@@ -73,7 +73,15 @@ static bool parentOpHasMainLoopAttr(Operation *syncOp) {
   if (!syncOp) {
     return false;
   }
-  return CVPipeline::isMainLoopOp(syncOp->getParentOp());
+  // The sync may sit inside scf.if wrappers inside the main loop; walk the
+  // ancestor chain instead of checking the immediate parent only.
+  for (Operation *ancestor = syncOp->getParentOp(); ancestor;
+       ancestor = ancestor->getParentOp()) {
+    if (CVPipeline::isMainLoopOp(ancestor)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // --- Tag-driven transfer op classification helpers ---
@@ -528,6 +536,21 @@ static int buildTransferGroupData(int tid, const SmallVector<Operation *> &ops,
   }
   info.senderChain = chainInfo.sender;
   info.receiverChain = chainInfo.receiver;
+
+  // 3.5 Chain completeness: each side needs both its wait and set syncs.
+  // Wrapping half a handshake (producer alternates flags while the consumer
+  // does not) deadlocks; drop the group's chains entirely so the transfer
+  // stays single-buffered instead.
+  auto chainComplete = [](const TransferOpChain &chain) {
+    return !chain.transferOp || (chain.waitOp && chain.setOp);
+  };
+  if (!chainComplete(info.senderChain) || !chainComplete(info.receiverChain)) {
+    LDBG("Group tid=" << tid
+                      << " has an incomplete chain (wait/set missing), keeping"
+                      << " it single-buffered.");
+    info.senderChain = TransferOpChain();
+    info.receiverChain = TransferOpChain();
+  }
 
   // 4. Direction from the executing core's scope:
   // - sender in VECTOR scope: V→C; in CUBE scope: C→V
