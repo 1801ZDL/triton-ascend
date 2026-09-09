@@ -1333,6 +1333,22 @@ static Value prepareLoopPolling(Operation *loopOp, Operation *waitOp,
         whileOp.getLoc(), arith::CmpIPredicate::eq, remOp->getResult(0),
         c0Op->getResult(0));
     setSsbufferTags(condOp, condBuilder, *pollBlockId, tid);
+    // Counter increment: hoist to right after its first use (the parity
+    // remsi) so the +1 lands at the first arg19 use instead of the body end.
+    // Its operand-defining ops (the constant) move along, or the hoisted use
+    // would violate dominance.
+    SmallVector<Operation *> counterUpdates;
+    after.walk([&](Operation *op) {
+      if (op->hasAttr(CVPipeline::kIterCounter))
+        counterUpdates.push_back(op);
+    });
+    for (Operation *op : counterUpdates) {
+      op->moveAfter(remOp);
+      for (Value operand : op->getOperands())
+        if (Operation *defOp = operand.getDefiningOp())
+          if (defOp->getBlock() == op->getBlock())
+            defOp->moveBefore(op);
+    }
     return condOp->getResult(0);
   }
 
