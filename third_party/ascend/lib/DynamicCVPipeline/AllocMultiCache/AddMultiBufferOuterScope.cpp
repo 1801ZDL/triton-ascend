@@ -148,15 +148,6 @@ static std::optional<int> getFirstBlockId(Block *block) {
   return std::nullopt;
 }
 
-/// Last block_id found in a block's ops, if any
-static std::optional<int> getLastBlockId(Block *block) {
-  std::optional<int> last;
-  for (Operation &op : *block)
-    if (auto id = CVPipeline::getOpBlockId(&op))
-      last = id;
-  return last;
-}
-
 // --- Operation search helpers ---
 
 /// Find sync op with a specific flag, searching forward or backward in a block
@@ -892,6 +883,12 @@ static Value ensureWhileOpHasCounter(scf::WhileOp whileOp) {
         Block *oldAfter = oldWhile.getAfterBody();
         unsigned n = oldAfter->getNumArguments();
         counterIterArg = iterArgs[n];
+        // Counter update created at body start: the +1 lands at the counter's
+        // first use (the parity remsi added later by prepareLoopPolling).
+        counterOne = ab.create<arith::ConstantIntOp>(al, 1, kBits32);
+        counterAdd = ab.create<arith::AddIOp>(al, counterIterArg,
+                                              counterOne->getResult(0));
+        Value nextCounter = counterAdd->getResult(0);
         IRMapping map;
         for (unsigned i = 0; i < n; ++i)
           map.map(oldAfter->getArgument(i), iterArgs[i]);
@@ -900,10 +897,6 @@ static Value ensureWhileOpHasCounter(scf::WhileOp whileOp) {
           ab.clone(op, map);
 
         auto oldYield = cast<scf::YieldOp>(oldAfter->getTerminator());
-        counterOne = ab.create<arith::ConstantIntOp>(al, 1, kBits32);
-        counterAdd = ab.create<arith::AddIOp>(al, counterIterArg,
-                                              counterOne->getResult(0));
-        Value nextCounter = counterAdd->getResult(0);
         SmallVector<Value> yOps;
         for (Value v : oldYield.getOperands())
           yOps.push_back(map.lookupOrDefault(v));
@@ -916,13 +909,15 @@ static Value ensureWhileOpHasCounter(scf::WhileOp whileOp) {
     newWhile->setAttr(attr.getName(), attr.getValue());
   newWhile->setAttr(CVPipeline::kIterCounter, builder.getUnitAttr());
 
-  // Tag counter-update ops with the last block_id of the after body so
+  // Tag counter-update ops with the first block_id of the after body: they
+  // sit at body start, just ahead of the parity remsi added later, and
   // CloneOps' block-id contiguity check holds (mirrors InnerScope's
-  // insertWhileCounterOps).
+  // insertWhileCounterOps). The counter ops carry no block id yet at this
+  // point, so the scan naturally picks the first old-body op's id.
   Block &afterBody = newWhile.getAfter().front();
-  if (std::optional<int> lastBlockId = getLastBlockId(&afterBody);
-      lastBlockId && counterOne && counterAdd) {
-    IntegerAttr blockIdAttr = builder.getI32IntegerAttr(*lastBlockId);
+  if (std::optional<int> firstBlockId = getFirstBlockId(&afterBody);
+      firstBlockId && counterOne && counterAdd) {
+    IntegerAttr blockIdAttr = builder.getI32IntegerAttr(*firstBlockId);
     counterOne->setAttr(CVPipeline::kBlockId, blockIdAttr);
     counterAdd->setAttr(CVPipeline::kBlockId, blockIdAttr);
     counterAdd->setAttr(CVPipeline::kIterCounter, builder.getUnitAttr());
@@ -1333,29 +1328,6 @@ static Value prepareLoopPolling(Operation *loopOp, Operation *waitOp,
         whileOp.getLoc(), arith::CmpIPredicate::eq, remOp->getResult(0),
         c0Op->getResult(0));
     setSsbufferTags(condOp, condBuilder, *pollBlockId, tid);
-    // Counter increment: hoist to right after its first use (the parity
-    // remsi) so the +1 lands at the first arg19 use instead of the body end.
-    // Its operand-defining ops (the constant) move along, or the hoisted use
-    // would violate dominance. All hoisted ops are re-tagged with the new
-    // neighborhood's block id — CloneOps requires block-id contiguity.
-    SmallVector<Operation *> counterUpdates;
-    after.walk([&](Operation *op) {
-      if (op->hasAttr(CVPipeline::kIterCounter))
-        counterUpdates.push_back(op);
-    });
-    for (Operation *op : counterUpdates) {
-      op->moveAfter(remOp);
-      for (Value operand : op->getOperands())
-        if (Operation *defOp = operand.getDefiningOp())
-          if (defOp->getBlock() == op->getBlock())
-            defOp->moveBefore(op);
-      op->setAttr(CVPipeline::kBlockId,
-                  condBuilder.getI32IntegerAttr(*pollBlockId));
-      for (Value operand : op->getOperands())
-        if (Operation *defOp = operand.getDefiningOp())
-          defOp->setAttr(CVPipeline::kBlockId,
-                         condBuilder.getI32IntegerAttr(*pollBlockId));
-    }
     return condOp->getResult(0);
   }
 
