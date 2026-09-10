@@ -1354,12 +1354,14 @@ static Value getOrCreateLoopCond(Operation *loopOp, Operation *anchorWait,
   return cond;
 }
 
-/// Enclosing loop op (ForOp/WhileOp) of a sync op; the sync may sit inside
-/// scf.if wrappers
+/// Enclosing loop op (ForOp/WhileOp) of a sync op; walks out to the nearest
+/// loop of either kind, past scf.if wrappers and non-main inner loops
 static Operation *resolveLoopOp(Operation *op) {
-  if (auto forOp = op->getParentOfType<scf::ForOp>())
-    return forOp;
-  return op->getParentOfType<scf::WhileOp>();
+  for (Operation *ancestor = op->getParentOp(); ancestor;
+       ancestor = ancestor->getParentOp())
+    if (isa<scf::ForOp, scf::WhileOp>(ancestor))
+      return ancestor;
+  return nullptr;
 }
 
 static LogicalResult
