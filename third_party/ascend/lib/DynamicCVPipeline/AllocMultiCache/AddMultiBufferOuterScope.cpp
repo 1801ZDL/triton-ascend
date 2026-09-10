@@ -938,25 +938,24 @@ static Value createPollingCondition(scf::ForOp forOp, OpBuilder &builder,
   Value iterVar = forOp.getInductionVar();
   Value step = forOp.getStep();
 
-  Operation *divOp = builder.create<arith::DivSIOp>(loc, iterVar, step);
-  setSsbufferTags(divOp, builder, blockId, tid);
+  auto divOp = builder.create<arith::DivSIOp>(loc, iterVar, step);
+  setSsbufferTags(divOp.getOperation(), builder, blockId, tid);
 
-  Type counterType = divOp->getResult(0).getType();
+  Type counterType = divOp.getResult().getType();
   int bitWidth = counterType.getIntOrFloatBitWidth();
-  Operation *c2ValOp = builder.create<arith::ConstantIntOp>(loc, 2, bitWidth);
-  setSsbufferTags(c2ValOp, builder, blockId, tid);
-  Operation *remOp = builder.create<arith::RemSIOp>(loc, divOp->getResult(0),
-                                                    c2ValOp->getResult(0));
-  setSsbufferTags(remOp, builder, blockId, tid);
+  auto c2Val = builder.create<arith::ConstantIntOp>(loc, 2, bitWidth);
+  setSsbufferTags(c2Val.getOperation(), builder, blockId, tid);
+  auto remOp =
+      builder.create<arith::RemSIOp>(loc, divOp.getResult(), c2Val.getResult());
+  setSsbufferTags(remOp.getOperation(), builder, blockId, tid);
 
-  Operation *c0ValOp = builder.create<arith::ConstantIntOp>(loc, 0, bitWidth);
-  Operation *cmpOp =
-      builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
-                                    remOp->getResult(0), c0ValOp->getResult(0));
-  setSsbufferTags(cmpOp, builder, blockId, tid);
-  setSsbufferTags(c0ValOp, builder, blockId, tid);
+  auto c0Val = builder.create<arith::ConstantIntOp>(loc, 0, bitWidth);
+  auto cmpOp = builder.create<arith::CmpIOp>(
+      loc, arith::CmpIPredicate::eq, remOp.getResult(), c0Val.getResult());
+  setSsbufferTags(cmpOp.getOperation(), builder, blockId, tid);
+  setSsbufferTags(c0Val.getOperation(), builder, blockId, tid);
 
-  return cmpOp->getResult(0);
+  return cmpOp.getResult();
 }
 
 /// Wrap a sync op (wait/set) in scf.if: then=clone original, else=create
