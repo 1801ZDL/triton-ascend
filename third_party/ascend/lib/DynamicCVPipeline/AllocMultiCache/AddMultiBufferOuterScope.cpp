@@ -83,8 +83,7 @@ static Operation *findMainLoopOp(Operation *op) {
       op, [](Operation *cur) { return CVPipeline::isMainLoopOp(cur); });
 }
 
-/// Check if a sync op is nested inside a main_loop op (forOp / whileOp
-/// carrying the ssbuffer.main_loop attribute)
+/// True if the sync op is nested inside a main_loop op (ForOp/WhileOp).
 static bool parentOpHasMainLoopAttr(Operation *syncOp) {
   if (!syncOp) {
     return false;
@@ -839,13 +838,9 @@ static int setSsbufferTags(Operation *op, OpBuilder &builder, int blockId,
   return 0;
 }
 
-/// Ensure a WhileOp has an i32 iteration counter loop-carried variable.
-/// Returns the counter Value; polling condition is (counter % 2) == 0.
-/// Reuses an existing counter (e.g. one injected by InnerScope, detected via
-/// ssbuffer.iterCounter); injects a new one only when absent. An existing
-/// counter update sitting at the body end (InnerScope's position) is moved to
-/// the body start and re-tagged with the first body block id so CloneOps'
-/// block-id contiguity holds; updates already at the head are left untouched.
+/// Ensure a WhileOp has an i32 iteration counter (polling: counter % 2 == 0).
+/// - reuse an existing one (InnerScope-injected, kIterCounter on the while)
+/// - normalize its body-end update: move to body head, re-tag first block id
 static Value ensureWhileOpHasCounter(scf::WhileOp whileOp) {
   if (whileOp->hasAttr(CVPipeline::kIterCounter)) {
     Block &after = whileOp.getAfter().front();
@@ -918,8 +913,8 @@ static Value ensureWhileOpHasCounter(scf::WhileOp whileOp) {
         Block *oldAfter = oldWhile.getAfterBody();
         unsigned n = oldAfter->getNumArguments();
         counterIterArg = iterArgs[n];
-        // Counter update created at body start: the +1 lands at the counter's
-        // first use (the parity remsi added later by prepareLoopPolling).
+        // Counter update at body start; prepareLoopPolling builds the
+        // polling chain around it (c2+remsi before, c0+cmpi after).
         counterOne = ab.create<arith::ConstantIntOp>(al, 1, kBits32);
         counterAdd = ab.create<arith::AddIOp>(al, counterIterArg,
                                               counterOne->getResult(0));
@@ -944,11 +939,9 @@ static Value ensureWhileOpHasCounter(scf::WhileOp whileOp) {
     newWhile->setAttr(attr.getName(), attr.getValue());
   newWhile->setAttr(CVPipeline::kIterCounter, builder.getUnitAttr());
 
-  // Tag counter-update ops with the first block_id of the after body: they
-  // sit at body start, just ahead of the parity remsi added later, and
-  // CloneOps' block-id contiguity check holds (mirrors InnerScope's
-  // insertWhileCounterOps). The counter ops carry no block id yet at this
-  // point, so the scan naturally picks the first old-body op's id.
+  // Tag counter-update ops with the first body block_id (CloneOps
+  // contiguity, mirrors InnerScope); they carry no id yet, so the scan
+  // picks the first old-body op's id.
   Block &afterBody = newWhile.getAfter().front();
   if (std::optional<int> firstBlockId = getFirstBlockId(&afterBody);
       firstBlockId && counterOne && counterAdd) {
@@ -1337,21 +1330,16 @@ static Value prepareLoopPolling(Operation *loopOp, Operation *waitOp,
   }
 
   if (auto whileOp = dyn_cast<scf::WhileOp>(loopOp)) {
-    // A counter is guaranteed only for main_loop whiles (preInject or
-    // InnerScope, both tagging kIterCounter on the while). A plain while
-    // resolved here has no counter to poll on — fall back instead of
-    // building a condition off an unrelated iter_arg.
+    // Guard: only main_loop whiles carry an injected counter; a plain
+    // while here has none to poll on — fall back.
     if (!whileOp->hasAttr(CVPipeline::kIterCounter))
       return Value();
-    // Counter was already injected in preprocessing. Polling condition:
-    // (counter % 2) == 0. The counter update (const 1 + addi) sits at the
-    // body head (ensure creates it there; InnerScope-injected ones are
-    // normalized there too), so build the chain around it: c2 + remsi before
-    // it, c0 + cmpi after it — no op moves needed.
+    // Polling cond: (counter % 2) == 0. The counter update sits at the
+    // body head (created / normalized by ensure), so the chain is built
+    // around it: c2+remsi before, c0+cmpi after.
     Block &after = whileOp.getAfter().front();
     Value counter = after.getArgument(after.getNumArguments() - 1);
-    // Locate the counter update (top-level only — nested loops own their
-    // counters) before creating anything.
+    // Locate the counter update (top-level only; nested loops own theirs).
     Operation *lastCounterUpdate = nullptr;
     for (Operation &op : after)
       if (op.hasAttr(CVPipeline::kIterCounter))
@@ -1361,8 +1349,7 @@ static Value prepareLoopPolling(Operation *loopOp, Operation *waitOp,
                               lastCounterUpdate == after.front().getNextNode());
     // Insert at body start to dominate the wrapping scf.ifs.
     builderOut.setInsertionPointToStart(&after);
-    // Tag the condition ops with the first body block_id so the
-    // block-id contiguity check in CloneOps holds.
+    // Tag the cond ops with the first body block_id (CloneOps contiguity).
     std::optional<int> pollBlockId = getFirstBlockId(&after);
     if (!pollBlockId)
       pollBlockId = bid;
@@ -1373,10 +1360,10 @@ static Value prepareLoopPolling(Operation *loopOp, Operation *waitOp,
     Operation *remOp = condBuilder.create<arith::RemSIOp>(
         whileOp.getLoc(), counter, c2Op->getResult(0));
     setSsbufferTags(remOp, condBuilder, *pollBlockId, tid);
-    // With the counter update at the head, put c0 + cmpi right after it so
-    // the +1 lands between the remsi and the cmpi (the validated backend
-    // ordering). Otherwise keep the whole chain contiguous at the body start
-    // — the cond must dominate the wrapping scf.ifs.
+    // Put c0+cmpi right after the counter update:
+    // - +1 lands between remsi and cmpi (validated backend ordering)
+    // - otherwise chain stays contiguous at body start: the cond must
+    //   dominate the wrapping scf.ifs
     if (counterAtHead)
       condBuilder.setInsertionPointAfter(lastCounterUpdate);
     Operation *c0Op =
@@ -1413,10 +1400,8 @@ static Value getOrCreateLoopCond(Operation *loopOp, Operation *anchorWait,
   return cond;
 }
 
-/// Enclosing loop op (ForOp/WhileOp) of a sync op; the sync may sit inside
-/// scf.if wrappers. Returns the nearest enclosing loop: walking up parents,
-/// the first For or While wins — a While nested in a For must resolve to the
-/// While, not the For.
+/// Nearest ForOp/WhileOp ancestor of a sync op (sync may sit in scf.if).
+/// A While nested in a For resolves to the While, not the For.
 static Operation *resolveLoopOp(Operation *op) {
   return findAncestorOp(op, [](Operation *cur) {
     return isa<scf::ForOp>(cur) || isa<scf::WhileOp>(cur);
