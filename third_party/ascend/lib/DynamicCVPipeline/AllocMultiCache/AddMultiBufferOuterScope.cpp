@@ -1420,8 +1420,7 @@ addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups, int &errCode) {
   // Anchor per loop: the earliest wait across all groups — the shared cond
   // must dominate every group's scf.if wrappers.
   DenseMap<Operation *, Operation *> loopAnchor;
-  for (auto &p : groups) {
-    TransferGroupInfo &g = p.second;
+  for (auto &[tid, group] : groups) {
     auto track = [&](Operation *waitOp) {
       if (!waitOp) {
         return;
@@ -1433,46 +1432,44 @@ addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups, int &errCode) {
         loopAnchor[loop] = waitOp;
       }
     };
-    track(g.senderChain.waitOp);
-    track(g.receiverChain.waitOp);
+    track(group.senderChain.waitOp);
+    track(group.receiverChain.waitOp);
   }
 
   DenseMap<Operation *, Value> condCache;
-  for (auto &p : groups) {
-    TransferGroupInfo &g = p.second;
-
+  for (auto &[tid, group] : groups) {
     // Get sender's loop op (ForOp or WhileOp)
-    Operation *senderWaitParent = resolveLoopOp(g.senderChain.waitOp);
+    Operation *senderWaitParent = resolveLoopOp(group.senderChain.waitOp);
 
     // Shared polling condition for the sender loop
     OpBuilder senderBuilder(senderWaitParent->getContext());
     Value senderCond = getOrCreateLoopCond(
         senderWaitParent, loopAnchor[senderWaitParent], condCache);
     if (!senderCond) {
-      LDBG("FALLBACK: unexpected sender loop op "
-           << senderWaitParent->getName()
+      LDBG("FALLBACK: unexpected sender loop op, tid="
+           << tid << ", op=" << *senderWaitParent
            << ", rc=" << CVPipeline::ERRCODE_IGNORED << ".");
       errCode = CVPipeline::ERRCODE_IGNORED;
       return failure();
     }
 
     // Process sender chain (isProducer=true)
-    if (failed(processTransferChain(g.senderChain, senderCond,
-                                    g.senderOutputBuffer, g.outputFlag, true,
-                                    senderBuilder))) {
+    if (failed(processTransferChain(group.senderChain, senderCond,
+                                    group.senderOutputBuffer, group.outputFlag,
+                                    true, senderBuilder))) {
       errCode = CVPipeline::ERRCODE_FAILED;
       return failure();
     }
 
     // Process receiver chain (may use different loop op) (isProducer=false)
-    if (g.receiverChain.waitOp) {
-      Operation *receiverWaitParent = resolveLoopOp(g.receiverChain.waitOp);
+    if (group.receiverChain.waitOp) {
+      Operation *receiverWaitParent = resolveLoopOp(group.receiverChain.waitOp);
 
       if (receiverWaitParent == senderWaitParent) {
         // Use the same cond and builder
-        if (failed(processTransferChain(g.receiverChain, senderCond,
-                                        g.receiverOutputBuffer, g.outputFlag,
-                                        false, senderBuilder))) {
+        if (failed(processTransferChain(
+                group.receiverChain, senderCond, group.receiverOutputBuffer,
+                group.outputFlag, false, senderBuilder))) {
           errCode = CVPipeline::ERRCODE_FAILED;
           return failure();
         }
@@ -1482,15 +1479,15 @@ addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups, int &errCode) {
         Value receiverCond = getOrCreateLoopCond(
             receiverWaitParent, loopAnchor[receiverWaitParent], condCache);
         if (!receiverCond) {
-          LDBG("FALLBACK: unexpected receiver loop op "
-               << receiverWaitParent->getName()
+          LDBG("FALLBACK: unexpected receiver loop op, tid="
+               << tid << ", op=" << *receiverWaitParent
                << ", rc=" << CVPipeline::ERRCODE_IGNORED << ".");
           errCode = CVPipeline::ERRCODE_IGNORED;
           return failure();
         }
-        if (failed(processTransferChain(g.receiverChain, receiverCond,
-                                        g.receiverOutputBuffer, g.outputFlag,
-                                        false, receiverBuilder))) {
+        if (failed(processTransferChain(
+                group.receiverChain, receiverCond, group.receiverOutputBuffer,
+                group.outputFlag, false, receiverBuilder))) {
           errCode = CVPipeline::ERRCODE_FAILED;
           return failure();
         }
