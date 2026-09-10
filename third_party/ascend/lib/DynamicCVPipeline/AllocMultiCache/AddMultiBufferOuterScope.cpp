@@ -834,10 +834,36 @@ static int setSsbufferTags(Operation *op, OpBuilder &builder, int blockId,
 /// Ensure a WhileOp has an i32 iteration counter loop-carried variable.
 /// Returns the counter Value; polling condition is (counter % 2) == 0.
 /// Reuses an existing counter (e.g. one injected by InnerScope, detected via
-/// ssbuffer.iterCounter); injects a new one only when absent.
+/// ssbuffer.iterCounter); injects a new one only when absent. An existing
+/// counter update sitting at the body end (InnerScope's position) is moved to
+/// the body start and re-tagged with the first body block id so CloneOps'
+/// block-id contiguity holds; updates already at the head are left untouched.
 static Value ensureWhileOpHasCounter(scf::WhileOp whileOp) {
   if (whileOp->hasAttr(CVPipeline::kIterCounter)) {
     Block &after = whileOp.getAfter().front();
+    SmallVector<Operation *> updates;
+    for (Operation &op : after)
+      if (op.hasAttr(CVPipeline::kIterCounter))
+        updates.push_back(&op);
+    for (Operation *addi : updates) {
+      Operation *firstOp = &after.front();
+      if (addi == firstOp || addi == firstOp->getNextNode())
+        continue; // already at head
+      std::optional<int> firstId = getFirstBlockId(&after);
+      if (!firstId)
+        continue;
+      addi->moveBefore(&after, after.begin());
+      for (Value operand : addi->getOperands())
+        if (Operation *defOp = operand.getDefiningOp())
+          if (defOp->getBlock() == &after)
+            defOp->moveBefore(addi);
+      OpBuilder tagBuilder(whileOp.getContext());
+      IntegerAttr blockIdAttr = tagBuilder.getI32IntegerAttr(*firstId);
+      addi->setAttr(CVPipeline::kBlockId, blockIdAttr);
+      for (Value operand : addi->getOperands())
+        if (Operation *defOp = operand.getDefiningOp())
+          defOp->setAttr(CVPipeline::kBlockId, blockIdAttr);
+    }
     return after.getArgument(after.getNumArguments() - 1);
   }
 
@@ -1328,6 +1354,29 @@ static Value prepareLoopPolling(Operation *loopOp, Operation *waitOp,
         whileOp.getLoc(), arith::CmpIPredicate::eq, remOp->getResult(0),
         c0Op->getResult(0));
     setSsbufferTags(condOp, condBuilder, *pollBlockId, tid);
+    // Counter update: hoist right after the parity remsi (its first use) so
+    // the +1 sits ahead of the cmpi at the body start, matching the validated
+    // backend ordering. Top-level ops only — counters of nested loops belong
+    // to their own loops. Operand-defining ops in the same block (the +1
+    // constant) move along to keep dominance; all hoisted ops are re-tagged
+    // with the polling neighborhood's block id for CloneOps contiguity.
+    SmallVector<Operation *> counterUpdates;
+    for (Operation &op : after)
+      if (op.hasAttr(CVPipeline::kIterCounter))
+        counterUpdates.push_back(&op);
+    for (Operation *op : counterUpdates) {
+      op->moveAfter(remOp);
+      for (Value operand : op->getOperands())
+        if (Operation *defOp = operand.getDefiningOp())
+          if (defOp->getBlock() == op->getBlock())
+            defOp->moveBefore(op);
+      op->setAttr(CVPipeline::kBlockId,
+                  condBuilder.getI32IntegerAttr(*pollBlockId));
+      for (Value operand : op->getOperands())
+        if (Operation *defOp = operand.getDefiningOp())
+          defOp->setAttr(CVPipeline::kBlockId,
+                         condBuilder.getI32IntegerAttr(*pollBlockId));
+    }
     return condOp->getResult(0);
   }
 
@@ -1356,11 +1405,14 @@ static Value getOrCreateLoopCond(Operation *loopOp, Operation *anchorWait,
 }
 
 /// Enclosing loop op (ForOp/WhileOp) of a sync op; the sync may sit inside
-/// scf.if wrappers
+/// scf.if wrappers. Returns the nearest enclosing loop: walking up parents,
+/// the first For or While wins — a While nested in a For must resolve to the
+/// While, not the For.
 static Operation *resolveLoopOp(Operation *op) {
-  if (auto forOp = op->getParentOfType<scf::ForOp>())
-    return forOp;
-  return op->getParentOfType<scf::WhileOp>();
+  for (Operation *cur = op->getParentOp(); cur; cur = cur->getParentOp())
+    if (isa<scf::ForOp>(cur) || isa<scf::WhileOp>(cur))
+      return cur;
+  return nullptr;
 }
 
 static LogicalResult
