@@ -114,9 +114,10 @@ static bool hasWriteEffectOn(Operation *op, Value buffer) {
 /// Walk single-use memref chain from receiverOp to the first op producing a
 /// tensor. Returns nullptr when:
 /// - head result is not a memref
-/// - chain forks (multi-use), leaves the block, or hits a result-less op
+/// - chain forks (multi-use), leaves the block, or hits an op that does not
+///   produce exactly one result
 static Operation *findChainTensorTerminal(Operation *receiverOp) {
-  if (receiverOp->getNumResults() == 0) {
+  if (receiverOp->getNumResults() != 1) {
     return nullptr;
   }
   Value cur = receiverOp->getResult(0);
@@ -128,7 +129,7 @@ static Operation *findChainTensorTerminal(Operation *receiverOp) {
       return nullptr; // forked chain: ambiguous
     }
     Operation *user = *cur.getUsers().begin();
-    if (user->getBlock() != block || user->getNumResults() == 0) {
+    if (user->getBlock() != block || user->getNumResults() != 1) {
       return nullptr;
     }
     Value result = user->getResult(0);
