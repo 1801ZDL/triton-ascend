@@ -517,8 +517,7 @@ static int collectTransferGroupData(
   for (auto &entry : outputFlagByKey) {
     for (int attempt = 0; attempt < kMaxFlagAttempts; ++attempt) {
       int64_t pf = flagIdMgr.acquireId();
-      if (pf == FlagIdManager::INVALID_FLAG_ID ||
-          pf != entry.first.first) {
+      if (pf == FlagIdManager::INVALID_FLAG_ID || pf != entry.first.first) {
         entry.second = static_cast<int>(pf);
         break;
       }
