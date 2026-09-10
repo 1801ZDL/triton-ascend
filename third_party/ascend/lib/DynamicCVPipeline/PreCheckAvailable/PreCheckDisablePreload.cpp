@@ -48,8 +48,7 @@ static const llvm::SmallVector<llvm::StringRef> kBlacklistFuncNames = {
     "_jagged_dense_flash_attention_bwd_dk_kernel",
     "_gqa_sparse_decode_kernel",
     "paged_decode_fd_reduce_kernel",
-    "paged_decode_fd_kernel",
-    "flash_fwd_kernel"};
+    "paged_decode_fd_kernel"};
 
 static constexpr const char *DEBUG_TYPE = "pre-check-disable-preload";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
