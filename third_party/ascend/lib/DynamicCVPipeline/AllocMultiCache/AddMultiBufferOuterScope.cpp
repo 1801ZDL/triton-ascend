@@ -955,6 +955,31 @@ static Value ensureWhileOpHasCounter(scf::WhileOp whileOp) {
   return counterIterArg;
 }
 
+/// Build the parity compare chain (c2 → remsi → c0 → cmpi) over `dividend`,
+/// all tagged with (blockId, tid). When `insertC0After` is non-null, c0+cmpi
+/// are placed right after it (e.g. the counter increment, so +1 lands between
+/// remsi and cmpi — validated backend ordering); otherwise the chain stays
+/// contiguous at the builder's insertion point.
+static Value buildParityCondition(OpBuilder &builder, Location loc,
+                                  Value dividend, int blockId, int tid,
+                                  Operation *insertC0After = nullptr) {
+  int bitWidth = dividend.getType().getIntOrFloatBitWidth();
+  Operation *c2Op = builder.create<arith::ConstantIntOp>(loc, 2, bitWidth);
+  setSsbufferTags(c2Op, builder, blockId, tid);
+  Operation *remOp =
+      builder.create<arith::RemSIOp>(loc, dividend, c2Op->getResult(0));
+  setSsbufferTags(remOp, builder, blockId, tid);
+  if (insertC0After)
+    builder.setInsertionPointAfter(insertC0After);
+  Operation *c0Op = builder.create<arith::ConstantIntOp>(loc, 0, bitWidth);
+  setSsbufferTags(c0Op, builder, blockId, tid);
+  Operation *condOp = builder.create<arith::CmpIOp>(
+      loc, arith::CmpIPredicate::eq, remOp->getResult(0),
+      c0Op->getResult(0));
+  setSsbufferTags(condOp, builder, blockId, tid);
+  return condOp->getResult(0);
+}
+
 /// Create polling condition: (iter / step) % 2 == 0 (true=input, false=output)
 static Value createPollingCondition(scf::ForOp forOp, OpBuilder &builder,
                                     int blockId, int tid) {
@@ -965,21 +990,7 @@ static Value createPollingCondition(scf::ForOp forOp, OpBuilder &builder,
   auto divOp = builder.create<arith::DivSIOp>(loc, iterVar, step);
   setSsbufferTags(divOp.getOperation(), builder, blockId, tid);
 
-  Type counterType = divOp.getResult().getType();
-  int bitWidth = counterType.getIntOrFloatBitWidth();
-  auto c2Val = builder.create<arith::ConstantIntOp>(loc, 2, bitWidth);
-  setSsbufferTags(c2Val.getOperation(), builder, blockId, tid);
-  auto remOp =
-      builder.create<arith::RemSIOp>(loc, divOp.getResult(), c2Val.getResult());
-  setSsbufferTags(remOp.getOperation(), builder, blockId, tid);
-
-  auto c0Val = builder.create<arith::ConstantIntOp>(loc, 0, bitWidth);
-  auto cmpOp = builder.create<arith::CmpIOp>(
-      loc, arith::CmpIPredicate::eq, remOp.getResult(), c0Val.getResult());
-  setSsbufferTags(cmpOp.getOperation(), builder, blockId, tid);
-  setSsbufferTags(c0Val.getOperation(), builder, blockId, tid);
-
-  return cmpOp.getResult();
+  return buildParityCondition(builder, loc, divOp.getResult(), blockId, tid);
 }
 
 /// Wrap a sync op (wait/set) in scf.if: then=clone original, else=create
@@ -1356,26 +1367,12 @@ static Value prepareLoopPolling(Operation *loopOp, Operation *waitOp,
     if (!pollBlockId)
       pollBlockId = bid;
     OpBuilder condBuilder(builderOut);
-    Operation *c2Op =
-        condBuilder.create<arith::ConstantIntOp>(whileOp.getLoc(), 2, kBits32);
-    setSsbufferTags(c2Op, condBuilder, *pollBlockId, tid);
-    Operation *remOp = condBuilder.create<arith::RemSIOp>(
-        whileOp.getLoc(), counter, c2Op->getResult(0));
-    setSsbufferTags(remOp, condBuilder, *pollBlockId, tid);
-    // Put c0+cmpi right after the counter update:
-    // - +1 lands between remsi and cmpi (validated backend ordering)
-    // - otherwise chain stays contiguous at body start: the cond must
-    //   dominate the wrapping scf.ifs
-    if (counterAtHead)
-      condBuilder.setInsertionPointAfter(lastCounterUpdate);
-    Operation *c0Op =
-        condBuilder.create<arith::ConstantIntOp>(whileOp.getLoc(), 0, kBits32);
-    setSsbufferTags(c0Op, condBuilder, *pollBlockId, tid);
-    Operation *condOp = condBuilder.create<arith::CmpIOp>(
-        whileOp.getLoc(), arith::CmpIPredicate::eq, remOp->getResult(0),
-        c0Op->getResult(0));
-    setSsbufferTags(condOp, condBuilder, *pollBlockId, tid);
-    return condOp->getResult(0);
+    // When the counter update is at head, c0+cmpi go right after it so +1
+    // lands between remsi and cmpi (validated backend ordering); otherwise
+    // the chain stays contiguous at body start.
+    return buildParityCondition(condBuilder, whileOp.getLoc(), counter,
+                                *pollBlockId, tid,
+                                counterAtHead ? lastCounterUpdate : nullptr);
   }
 
   // Unexpected loop type: caller falls back with ERRCODE_IGNORED.
