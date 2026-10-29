@@ -1,8 +1,8 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index cab58801f..406ed4634 100644
+index cab58801f..15f125080 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -15,13 +15,22 @@ include(CTest)
+@@ -15,13 +15,27 @@ include(CTest)
  
  list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
  
@@ -17,6 +17,11 @@ index cab58801f..406ed4634 100644
  option(TRITON_BUILD_WITH_CCACHE "Build with ccache (if available)" ON)
  set(TRITON_CODEGEN_BACKENDS "" CACHE STRING "Enable different codegen backends")
  
++if("ascend" IN_LIST TRITON_CODEGEN_BACKENDS)
++  add_compile_definitions(BSPUB_DAVINCI_BISHENGIR=0)
++  list(APPEND LLVM_TABLEGEN_FLAGS "-DBSPUB_DAVINCI_BISHENGIR")
++endif()
++
 +if(TRITON_BUILD_TD)
 +  set(TRITON_USE_ASCEND ON)
 +  add_compile_definitions(TRITON_USE_ASCEND=1)
@@ -25,7 +30,7 @@ index cab58801f..406ed4634 100644
  if(TRITON_BUILD_WITH_CCACHE)
    find_program(CCACHE_PROGRAM ccache)
    if(CCACHE_PROGRAM)
-@@ -129,6 +138,21 @@ function(add_triton_library name)
+@@ -129,6 +143,21 @@ function(add_triton_library name)
    set_property(GLOBAL APPEND PROPERTY TRITON_LIBS ${name})
    add_triton_object(${name} ${ARGN})
    llvm_update_compile_flags(${name})
@@ -47,7 +52,7 @@ index cab58801f..406ed4634 100644
  endfunction()
  
  set_property(GLOBAL PROPERTY TRITON_PLUGINS "")
-@@ -164,6 +188,21 @@ if (NOT WIN32 AND NOT APPLE AND NOT BSD)
+@@ -164,6 +193,21 @@ if (NOT WIN32 AND NOT APPLE AND NOT BSD)
    link_libraries(stdc++fs)
  endif()
  
@@ -69,7 +74,7 @@ index cab58801f..406ed4634 100644
  
  # -----
  
-@@ -176,11 +215,21 @@ if(TRITON_BUILD_PYTHON_MODULE)
+@@ -176,11 +220,21 @@ if(TRITON_BUILD_PYTHON_MODULE)
    # Python Interpreter is used to run lit tests
    find_package(Python3 REQUIRED COMPONENTS Development.Module Interpreter)
    find_package(pybind11 CONFIG REQUIRED HINTS "${Python3_SITELIB}")
@@ -91,17 +96,17 @@ index cab58801f..406ed4634 100644
    if (TRITON_BUILD_PROTON)
      add_subdirectory(third_party/proton)
    endif()
-@@ -306,11 +355,6 @@ if(TRITON_BUILD_PYTHON_MODULE)
+@@ -306,11 +360,6 @@ if(TRITON_BUILD_PYTHON_MODULE)
        message(FATAL_ERROR "TRITON_WHEEL_DIR must be set.")
    endif()
-
+ 
 -  configure_file(
 -    "${LLVM_SYSPATH}/bin/FileCheck"
 -    "${TRITON_WHEEL_DIR}/FileCheck"
 -    COPYONLY)
 -
  endif()
-
+ 
  if (UNIX AND NOT APPLE)
 @@ -338,6 +387,12 @@ endif()
  find_package(Threads REQUIRED)
@@ -239,7 +244,7 @@ index cc0b4fa15..82f52f87e 100644
    TritonTestDialect
    TritonTestProton
 diff --git a/bin/RegisterTritonDialects.h b/bin/RegisterTritonDialects.h
-index 48049f026..e96284bc2 100644
+index 48049f026..78eabc5f9 100644
 --- a/bin/RegisterTritonDialects.h
 +++ b/bin/RegisterTritonDialects.h
 @@ -1,6 +1,36 @@
@@ -279,7 +284,7 @@ index 48049f026..e96284bc2 100644
  #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
  #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
  #include "proton/Dialect/include/Conversion/ProtonGPUToLLVM/Passes.h"
-@@ -85,6 +114,19 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
+@@ -85,6 +115,19 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
    mlir::triton::registerConvertTritonGPUToLLVMPass();
    mlir::triton::registerConvertNVGPUToLLVMPass();
    mlir::triton::registerAllocateSharedMemoryNvPass();
@@ -299,7 +304,7 @@ index 48049f026..e96284bc2 100644
    mlir::registerLLVMDIScope();
    mlir::LLVM::registerInlinerInterface(registry);
    mlir::NVVM::registerInlinerInterface(registry);
-@@ -136,16 +178,39 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
+@@ -136,16 +179,39 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
    mlir::triton::proton::gpu::registerScheduleBufferStorePass();
    mlir::triton::proton::gpu::registerAddSchedBarriersPass();
  
@@ -348,13 +353,13 @@ index 2d2570771..91ed8b79a 100644
 @@ -1,4 +1,5 @@
  #include "./RegisterTritonDialects.h"
 +#include "ascend/include/DynamicCVPipeline/AllocMultiCache/AddMultiBufferInnerScope.h"
-
+ 
  #include "mlir/Tools/mlir-opt/MlirOptMain.h"
-
+ 
 @@ -6,6 +7,9 @@ int main(int argc, char **argv) {
    mlir::DialectRegistry registry;
    registerTritonDialects(registry);
-
+ 
 +  // Register AddMultiBufferInnerScope pass
 +  mlir::triton::registerAddMultiBufferInnerScopePasses();
 +
@@ -362,10 +367,19 @@ index 2d2570771..91ed8b79a 100644
        argc, argv, "Triton (GPU) optimizer driver\n", registry));
  }
 diff --git a/include/triton/Dialect/Triton/IR/TritonAttrDefs.td b/include/triton/Dialect/Triton/IR/TritonAttrDefs.td
-index 5a76a1d7b..4114df60c 100644
+index 5a76a1d7b..ec659dcaa 100644
 --- a/include/triton/Dialect/Triton/IR/TritonAttrDefs.td
 +++ b/include/triton/Dialect/Triton/IR/TritonAttrDefs.td
-@@ -130,8 +130,9 @@ def TT_InputPrecisionAttr : I32EnumAttr<
+@@ -109,6 +109,8 @@ def TT_RoundingModeAttr : I32EnumAttr<
+     [
+         I32EnumAttrCase<"RTZ", 0, "rtz">,
+         I32EnumAttrCase<"RTNE", 1, "rtne">,
++        I32EnumAttrCase<"RTA", 2, "rta">,
++        I32EnumAttrCase<"HYBRID", 3, "hybrid">,
+     ]> {
+     let cppNamespace = "::mlir::triton";
+ }
+@@ -130,8 +132,9 @@ def TT_InputPrecisionAttr : I32EnumAttr<
        I32EnumAttrCase<"TF32", 0, "tf32">,
        I32EnumAttrCase<"TF32x3", 1, "tf32x3">,
        I32EnumAttrCase<"IEEE", 2, "ieee">,
@@ -414,10 +428,21 @@ index 1b72c1376..ee5defb6e 100644
    }
    return success();
 diff --git a/python/src/ir.cc b/python/src/ir.cc
-index 5af645bc0..011f82d60 100644
+index 5af645bc0..e323b5a04 100644
 --- a/python/src/ir.cc
 +++ b/python/src/ir.cc
-@@ -332,6 +332,7 @@ void init_triton_ir(py::module &&m) {
+@@ -322,7 +322,9 @@ void init_triton_ir(py::module &&m) {
+ 
+   py::enum_<RoundingMode>(m, "ROUNDING_MODE", py::module_local())
+       .value("RTZ", RoundingMode::RTZ)
+-      .value("RTNE", RoundingMode::RTNE);
++      .value("RTNE", RoundingMode::RTNE)
++      .value("RTA", RoundingMode::RTA)
++      .value("HYBRID", RoundingMode::HYBRID);
+ 
+   py::enum_<PropagateNan>(m, "PROPAGATE_NAN", py::module_local())
+       .value("NONE", PropagateNan::NONE)
+@@ -332,6 +334,7 @@ void init_triton_ir(py::module &&m) {
        .value("TF32", InputPrecision::TF32)
        .value("TF32x3", InputPrecision::TF32x3)
        .value("IEEE", InputPrecision::IEEE)
@@ -425,7 +450,18 @@ index 5af645bc0..011f82d60 100644
        .value("BF16x3", InputPrecision::BF16x3)
        .value("BF16x6", InputPrecision::BF16x6)
        .export_values();
-@@ -1790,6 +1791,18 @@ void init_triton_ir(py::module &&m) {
+@@ -975,6 +978,10 @@ void init_triton_ir(py::module &&m) {
+            [](TritonOpBuilder &self) -> Type {
+              return self.getBuilder().getI64Type();
+            })
++      .def("get_hif8_ty",
++           [](TritonOpBuilder &self) -> Type {
++             return self.getBuilder().getType<HiFloat8Type>();
++           })
+       .def("get_fp8e4nv_ty",
+            [](TritonOpBuilder &self) -> Type {
+              return self.getBuilder().getType<Float8E4M3FNType>();
+@@ -1790,6 +1797,18 @@ void init_triton_ir(py::module &&m) {
                                                  llvm::StringRef(message));
               self.create<AssertOp>(condition, messageAttr);
             })
@@ -445,7 +481,7 @@ index 5af645bc0..011f82d60 100644
             [](TritonOpBuilder &self, Value &condition) {
               self.create<LLVM::AssumeOp>(condition);
 diff --git a/python/triton/_utils.py b/python/triton/_utils.py
-index a3cf0ff0c..28ba11c92 100644
+index a3cf0ff0c..df22d9fe9 100644
 --- a/python/triton/_utils.py
 +++ b/python/triton/_utils.py
 @@ -50,8 +50,9 @@ def validate_block_shape(shape: List[int]):
@@ -460,8 +496,25 @@ index a3cf0ff0c..28ba11c92 100644
          numel *= d
  
      if numel > TRITON_MAX_TENSOR_NUMEL:
+@@ -66,6 +67,8 @@ type_canonicalisation_dict = {
+     "uint1": "u1",
+     "i1": "u1",
+     # floating-point dtypes:
++    "hifloat8": "hif8",
++    "hif8": "hif8",
+     "float8e4nv": "fp8e4nv",
+     "float8e5": "fp8e5",
+     "float8e4b15": "fp8e4b15",
+@@ -118,6 +121,7 @@ BITWIDTH_DICT: Dict[str, int] = {
+        for n in (16, 32, 64)},
+     **{f"fp8{suffix}": 8
+        for suffix in ("e4nv", "e4b15", "e4b8", "e5", "e5b16")},
++    "hif8": 8,
+     "bf16": 16,
+     "void": 0,
+ }
 diff --git a/python/triton/compiler/code_generator.py b/python/triton/compiler/code_generator.py
-index c572f81e3..6e06b8477 100644
+index c572f81e3..4b4332368 100644
 --- a/python/triton/compiler/code_generator.py
 +++ b/python/triton/compiler/code_generator.py
 @@ -10,8 +10,16 @@ from dataclasses import dataclass
@@ -733,7 +786,7 @@ index 39e6c4dfb..c72ca65c2 100644
 +    def format_line_delim(self, keyword):
 +        return f"///------------------{keyword}------------------\n"
 diff --git a/python/triton/language/math.py b/python/triton/language/math.py
-index 582cd876cb..13ff1cef09 100644
+index 582cd876c..034fe0f87 100644
 --- a/python/triton/language/math.py
 +++ b/python/triton/language/math.py
 @@ -21,8 +21,12 @@ def _check_dtype(dtypes: List[str]) -> T:
@@ -761,10 +814,19 @@ index 582cd876cb..13ff1cef09 100644
  @core._tensor_member_fn
  def exp(x, _semantic=None):
 diff --git a/python/triton/language/semantic.py b/python/triton/language/semantic.py
-index 52192cf3e..241ba3378 100644
+index 42bf7024f..15c361a01 100644
 --- a/python/triton/language/semantic.py
 +++ b/python/triton/language/semantic.py
-@@ -219,7 +219,7 @@ class TritonSemantic(Generic[TensorTy]):
+@@ -66,6 +66,8 @@ class TritonSemantic(Generic[TensorTy]):
+ 
+     def computation_type_impl(self, a_ty: tl.dtype, a_is_scalar: bool, b_ty: tl.dtype, b_is_scalar: bool,
+                               div_or_mod: bool) -> tl.dtype:
++        if a_ty.is_hif8() or b_ty.is_hif8():
++            return tl.float64 if a_ty.is_fp64() or b_ty.is_fp64() else tl.float32
+         # 0) For scalars we follow semantics similar to PyTorch, namely:
+         # - If the scalar is of a lower or equal kind (bool < uint < int < fp),
+         #   it doesn't participate in the promotion
+@@ -219,7 +221,7 @@ class TritonSemantic(Generic[TensorTy]):
          min_value = self.scalar_constant(min_value, tl.int64)
          cond = self.and_(self.less_equal(ret, max_value), self.greater_equal(ret, min_value))
          msg = f"int{lhs_sca_ty.int_bitwidth} overflow detected for operation {binary_op.__name__}"
@@ -773,7 +835,7 @@ index 52192cf3e..241ba3378 100644
  
      def add(self, input: TensorTy | numbers.Number, other: TensorTy | numbers.Number,
              sanitize_overflow: bool) -> TensorTy:
-@@ -344,6 +344,9 @@ class TritonSemantic(Generic[TensorTy]):
+@@ -344,6 +346,9 @@ class TritonSemantic(Generic[TensorTy]):
                  raise TypeError("Cannot mod " + scalar_ty.__repr__() + " by " + other_scalar_ty.__repr__() + " "
                                  "because they have different signedness;"
                                  "this is unlikely to result in a useful answer. Cast them to the same signedness.")
@@ -783,7 +845,7 @@ index 52192cf3e..241ba3378 100644
              if scalar_ty.is_int_signed():
                  return self.tensor(self.builder.create_srem(input.handle, other.handle), input.type)
              else:
-@@ -429,22 +432,61 @@ class TritonSemantic(Generic[TensorTy]):
+@@ -429,22 +434,61 @@ class TritonSemantic(Generic[TensorTy]):
          return self.tensor(self.builder.create_xor(input.handle, other.handle), input.type)
  
      def logical_and(self, input: TensorTy, other: TensorTy) -> TensorTy:
@@ -851,7 +913,7 @@ index 52192cf3e..241ba3378 100644
          return self.invert(input)
  
      def lshr(self, input: TensorTy, other: TensorTy) -> TensorTy:
-@@ -468,14 +510,22 @@ class TritonSemantic(Generic[TensorTy]):
+@@ -468,14 +512,22 @@ class TritonSemantic(Generic[TensorTy]):
  
      def minus(self, input: TensorTy) -> TensorTy:
          input_sca_ty = input.type.scalar
@@ -875,7 +937,7 @@ index 52192cf3e..241ba3378 100644
              raise ValueError("wrong type argument to unary invert (" + input_sca_ty.__repr__() + ")")
          _1 = self.tensor(self.builder.get_all_ones_value(input_sca_ty.to_ir(self.builder)), input_sca_ty)
          return self.xor_(input, _1)
-@@ -579,8 +629,11 @@ class TritonSemantic(Generic[TensorTy]):
+@@ -579,8 +631,11 @@ class TritonSemantic(Generic[TensorTy]):
          if end <= start:
              raise ValueError("arange's end argument must be greater than the start argument")
          range = end - start
@@ -889,7 +951,46 @@ index 52192cf3e..241ba3378 100644
          shape = [range]
          if ret_ty is None:
              ret_ty = tl.block_type(tl.int32, shape)
-@@ -1009,6 +1062,8 @@ class TritonSemantic(Generic[TensorTy]):
+@@ -606,6 +661,11 @@ class TritonSemantic(Generic[TensorTy]):
+         return self.scalar_constant(value, dtype)
+ 
+     def full(self, shape: List[int], value, dtype: tl.dtype) -> TensorTy:
++        if (dtype is not None and dtype.is_hif8() and shape
++                and (not isinstance(value, tl.tensor) or not value.dtype.is_hif8())):
++            # HiFloat8 constants need target conversion, not an IEEE FloatAttr.
++            # Broadcast in FP32 first so conversion remains a tensor operation.
++            return self.cast(self.full(shape, value, tl.float32), dtype)
+         return self.splat(self.make_scalar(value, dtype), shape)
+ 
+ # ===----------------------------------------------------------------------===//
+@@ -795,6 +855,26 @@ class TritonSemantic(Generic[TensorTy]):
+         src_ty = input.type
+         src_sca_ty = src_ty.scalar
+         dst_sca_ty = dst_ty.scalar
++        if src_sca_ty.is_hif8() or dst_sca_ty.is_hif8():
++            if src_sca_ty == dst_sca_ty:
++                return input
++            if src_ty.is_block():
++                dst_ty = src_ty.with_element_ty(dst_sca_ty)
++            if dst_sca_ty.is_hif8():
++                if not src_sca_ty.is_fp32():
++                    return self.cast(self.cast(input, tl.float32), dst_ty, fp_downcast_rounding)
++                modes = {None: ir.ROUNDING_MODE.RTA, "rta": ir.ROUNDING_MODE.RTA,
++                         "hybrid": ir.ROUNDING_MODE.HYBRID}
++                if fp_downcast_rounding not in modes:
++                    raise ValueError("HiFloat8 conversion supports rta or hybrid rounding")
++                rounding = modes[fp_downcast_rounding]
++            else:
++                if fp_downcast_rounding is not None:
++                    raise ValueError("Rounding is only selectable when converting to HiFloat8")
++                if not dst_sca_ty.is_fp32():
++                    return self.cast(self.cast(input, tl.float32), dst_ty)
++                rounding = None
++            return self.tensor(self.builder.create_fp_to_fp(input.handle, dst_ty.to_ir(self.builder), rounding), dst_ty)
+         if src_sca_ty == dst_sca_ty:
+             return input
+         if src_ty.is_block():
+@@ -1009,6 +1089,8 @@ class TritonSemantic(Generic[TensorTy]):
          # Check `boundary_check` argument
          boundary_check = self._canonicalize_boundary_check(boundary_check, dst_ty.get_block_shapes())
  
@@ -898,7 +999,7 @@ index 52192cf3e..241ba3378 100644
          # Build IR
          return self.tensor(
              self.builder.create_tensor_pointer_load(ptr.handle, boundary_check, padding, cache, eviction, is_volatile),
-@@ -1026,7 +1081,12 @@ class TritonSemantic(Generic[TensorTy]):
+@@ -1026,7 +1108,12 @@ class TritonSemantic(Generic[TensorTy]):
              raise ValueError("`padding_option` or `boundary_check` argument is not supported for loading a tensor of"
                               "pointers or loading a scalar. Because the compiler does not know the boundary; please "
                               "use block pointers (defined by `make_block_ptr`) instead")
@@ -912,7 +1013,7 @@ index 52192cf3e..241ba3378 100644
          # For a pointer of scalar, check the type of `mask` and `other`
          if not ptr.type.is_block():
              if mask and mask.type.is_block():
-@@ -1065,13 +1125,19 @@ class TritonSemantic(Generic[TensorTy]):
+@@ -1065,13 +1152,19 @@ class TritonSemantic(Generic[TensorTy]):
  
          # Build IR
          if mask is None:
@@ -937,7 +1038,19 @@ index 52192cf3e..241ba3378 100644
          return ret
  
      def load(self, ptr: TensorTy, mask: Optional[TensorTy], other: Optional[TensorTy], boundary_check: Tuple,
-@@ -1799,12 +1865,17 @@ class TritonSemantic(Generic[TensorTy]):
+@@ -1481,7 +1574,10 @@ class TritonSemantic(Generic[TensorTy]):
+             max_num_imprecise_acc: int, out_dtype: tl.dtype) -> TensorTy:
+         assert lhs.type.is_block() and rhs.type.is_block()
+ 
+-        if lhs.dtype.is_fp8() and rhs.dtype.is_fp8():
++        if lhs.dtype.is_hif8() or rhs.dtype.is_hif8():
++            if not (lhs.dtype.is_hif8() and rhs.dtype.is_hif8() and out_dtype.is_fp32()):
++                raise ValueError("HiFloat8 dot requires two HiFloat8 inputs and float32 accumulation")
++        elif lhs.dtype.is_fp8() and rhs.dtype.is_fp8():
+             # All combinations of supported fp8 x fp8 are permitted
+             pass
+         else:
+@@ -1837,12 +1933,17 @@ class TritonSemantic(Generic[TensorTy]):
          is_signed = [arg.dtype.is_int_signed() for arg in args]
          return self.tensor(self.builder.create_print(prefix, hex, new_args, is_signed), tl.void)
  
@@ -992,6 +1105,28 @@ index b1dd327bb..c49330d40 100644
  
  
  @core._tensor_member_fn
+diff --git a/python/triton/runtime/autotuner.py b/python/triton/runtime/autotuner.py
+index 0c4d71049..f05eee522 100644
+--- a/python/triton/runtime/autotuner.py
++++ b/python/triton/runtime/autotuner.py
+@@ -126,7 +126,7 @@ class Autotuner(KernelInterface):
+         return self._do_bench
+ 
+     def _bench(self, *args, config, **meta):
+-        from ..compiler.errors import CompileTimeAssertionFailure
++        from ..compiler.errors import CompileTimeAssertionFailure, MLIRCompilationError
+ 
+         verbose = knobs.autotuning.print
+         if verbose:
+@@ -162,7 +162,7 @@ class Autotuner(KernelInterface):
+ 
+         try:
+             return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+-        except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as e:
++        except (OutOfResources, CompileTimeAssertionFailure, PTXASError, MLIRCompilationError) as e:
+             if verbose:
+                 print(f"Autotuning failed with {e}")
+             return [float("inf"), float("inf"), float("inf")]
 diff --git a/python/triton/runtime/interpreter.py b/python/triton/runtime/interpreter.py
 index cd871cb2e..82eb6960d 100644
 --- a/python/triton/runtime/interpreter.py
@@ -1133,7 +1268,7 @@ diff --git a/python/triton/runtime/jit.py b/python/triton/runtime/jit.py
 index 0f506818f..43742c328 100644
 --- a/python/triton/runtime/jit.py
 +++ b/python/triton/runtime/jit.py
-@@ -398,14 +398,19 @@ def create_function_from_signature(sig, kparams, backend):
+@@ -398,33 +398,49 @@ def create_function_from_signature(sig, kparams, backend):
      assert len(sig.parameters) == len(kparams)
      # Create the function argument list and the dict entries for the return statement
      specialization = []
@@ -1157,7 +1292,7 @@ index 0f506818f..43742c328 100644
 +                   f"{effective_align})")
              if kp.annotation_type:
                  if isinstance(kp.annotation_type, str):
-@@ -413,7 +418,14 @@ def create_function_from_signature(sig, kparams, backend):
+                     if kp.annotation_type == "u1" or kp.annotation_type[:2] in ["fp", "bf"]:
                          # we do not specialize non-constexpr floats and bools:
                          specialize = False
                  if specialize:
@@ -1173,11 +1308,10 @@ index 0f506818f..43742c328 100644
                  else:
                      # skip runtime specialization:
                      specialization.append(f'("{kp.annotation_type}", None)')
-@@ -420,2 +432,3 @@ def create_function_from_signature(sig, kparams, backend):
              else:
 +                uses_alignment_specialization = uses_alignment_specialization or (align and specialize)
                  specialization.append(f"{ret}")
-@@ -423,8 +436,11 @@ def create_function_from_signature(sig, kparams, backend):
+ 
      # compute argument string for a given parameter
      arg = lambda x: x[0] if x[1].default is inspect.Parameter.empty else f"{x[0]}=default_{x[0]}"
 +    alignment_specialization_init = (f"    {alignment_specialization_name} = "
@@ -1190,25 +1324,3 @@ index 0f506818f..43742c328 100644
      specialization = [{','.join(specialization)}]
      return params, specialization, options
  """
-diff --git a/python/triton/runtime/autotuner.py b/python/triton/runtime/autotuner.py
-index 0c4d710496..d98afb86f9 100644
---- a/python/triton/runtime/autotuner.py
-+++ b/python/triton/runtime/autotuner.py
-@@ -126,7 +126,7 @@ class Autotuner(KernelInterface):
-         return self._do_bench
- 
-     def _bench(self, *args, config, **meta):
--        from ..compiler.errors import CompileTimeAssertionFailure
-+        from ..compiler.errors import CompileTimeAssertionFailure, MLIRCompilationError
- 
-         verbose = knobs.autotuning.print
-         if verbose:
-@@ -162,7 +162,7 @@ class Autotuner(KernelInterface):
- 
-         try:
-             return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
--        except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as e:
-+        except (OutOfResources, CompileTimeAssertionFailure, PTXASError, MLIRCompilationError) as e:
-             if verbose:
-                 print(f"Autotuning failed with {e}")
-             return [float("inf"), float("inf"), float("inf")]
