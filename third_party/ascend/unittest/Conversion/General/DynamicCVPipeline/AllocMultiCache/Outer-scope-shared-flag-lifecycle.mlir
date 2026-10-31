@@ -120,15 +120,15 @@ func.func @shared_c2v() {
     annotation.mark %buf0 {hivm.tightly_coupled_buffer = #hivm.tightly_coupled_buffer<0>, ssbuffer.block_id = 10 : i32, ssbuffer.transfer_id = 0 : i32} : memref<128xf16, #hivm.address_space<ub>>
     %buf1 = memref.alloc() {ssbuffer.block_id = 11 : i32, ssbuffer.transfer_id = 1 : i32} : memref<128xf16, #hivm.address_space<ub>>
     annotation.mark %buf1 {hivm.tightly_coupled_buffer = #hivm.tightly_coupled_buffer<1>, ssbuffer.block_id = 11 : i32, ssbuffer.transfer_id = 1 : i32} : memref<128xf16, #hivm.address_space<ub>>
-    %cc = memref.alloc() : memref<128xf16, #hivm.address_space<cc>>
+    %cc = memref.alloc() : memref<128xf32, #hivm.address_space<cc>>
     scf.for %i = %c0 to %c4 step %c1 : i32 {
       hivm.hir.sync_block_wait {ssbuffer.block_id = 10 : i32, ssbuffer.transfer_id = 0 : i32}[<CUBE>, <PIPE_V>, <PIPE_FIX>] flag = 0
-      hivm.hir.fixpipe {ssbuffer.block_id = 10 : i32, ssbuffer.transfer_id = 0 : i32} ins(%cc : memref<128xf16, #hivm.address_space<cc>>) outs(%buf0 : memref<128xf16, #hivm.address_space<ub>>)
+      hivm.hir.fixpipe {pre_quant = #hivm.fixpipe_pre_quant_mode<F322F16>, ssbuffer.block_id = 10 : i32, ssbuffer.transfer_id = 0 : i32} ins(%cc : memref<128xf32, #hivm.address_space<cc>>) outs(%buf0 : memref<128xf16, #hivm.address_space<ub>>)
       hivm.hir.sync_block_set {ssbuffer.block_id = 10 : i32, ssbuffer.transfer_id = 0 : i32}[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 0
     } {ssbuffer.main_loop = 0 : i32}
     scf.for %i = %c0 to %c4 step %c1 : i32 {
       hivm.hir.sync_block_wait {ssbuffer.block_id = 11 : i32, ssbuffer.transfer_id = 1 : i32}[<CUBE>, <PIPE_V>, <PIPE_FIX>] flag = 0
-      hivm.hir.fixpipe {ssbuffer.block_id = 11 : i32, ssbuffer.transfer_id = 1 : i32} ins(%cc : memref<128xf16, #hivm.address_space<cc>>) outs(%buf1 : memref<128xf16, #hivm.address_space<ub>>)
+      hivm.hir.fixpipe {pre_quant = #hivm.fixpipe_pre_quant_mode<F322F16>, ssbuffer.block_id = 11 : i32, ssbuffer.transfer_id = 1 : i32} ins(%cc : memref<128xf32, #hivm.address_space<cc>>) outs(%buf1 : memref<128xf16, #hivm.address_space<ub>>)
       hivm.hir.sync_block_set {ssbuffer.block_id = 11 : i32, ssbuffer.transfer_id = 1 : i32}[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 0
     } {ssbuffer.main_loop = 1 : i32}
     hivm.hir.sync_block_wait {ssbuffer.block_id = 11 : i32, ssbuffer.transfer_id = 1 : i32}[<CUBE>, <PIPE_V>, <PIPE_FIX>] flag = 0
